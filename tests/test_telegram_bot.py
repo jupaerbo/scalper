@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from telegram import Chat, InlineKeyboardMarkup, Message, MessageEntity, Update, User
 from telegram.ext import CallbackQueryHandler, ConversationHandler, filters
@@ -544,3 +545,128 @@ def test_error_handler_replies_without_raising() -> None:
     run(bot.on_error(update, context))
 
     update.effective_message.reply_text.assert_awaited_once()
+
+
+# --- Servidor HTTP para Render ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({}, 10000),
+        ({"PORT": "8080"}, 8080),
+        ({"PORT": " 3000 "}, 3000),
+        ({"PORT": ""}, 10000),
+        ({"PORT": "abc"}, 10000),
+        ({"PORT": "70000"}, 10000),
+    ],
+)
+def test_health_port_reads_env(env: dict[str, str], expected: int) -> None:
+    assert bot.health_port(env) == expected
+
+
+def _base_url(runner: Any) -> str:
+    host, port = runner.addresses[0][:2]
+    return f"http://{host}:{port}"
+
+
+def test_health_server_answers_200_ok_on_root() -> None:
+    async def scenario() -> list[tuple[int, str]]:
+        runner = await bot.start_health_server(0, host="127.0.0.1")
+        try:
+            async with httpx.AsyncClient(base_url=_base_url(runner)) as client:
+                get, head, other = (
+                    await client.get("/"),
+                    await client.head("/"),
+                    await client.get("/otra"),
+                )
+        finally:
+            await runner.cleanup()
+        return [(r.status_code, r.text) for r in (get, head, other)]
+
+    get, head, other = run(scenario())
+
+    assert get == (200, "OK")
+    assert head[0] == 200
+    assert other[0] == 404
+
+
+def test_build_application_without_port_has_no_http_server() -> None:
+    app = bot.build_application("123456:TEST-token")
+
+    assert app.post_init is None
+    assert app.post_shutdown is None
+
+
+def test_http_server_follows_application_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """post_init lo arranca y post_shutdown lo cierra, sin tocar los handlers."""
+    started: list[Any] = []
+    real_start = bot.start_health_server
+
+    async def local_start(port: int) -> Any:
+        runner = await real_start(port, host="127.0.0.1")
+        started.append(runner)
+        return runner
+
+    monkeypatch.setattr(bot, "start_health_server", local_start)
+    app = bot.build_application("123456:TEST-token", http_port=0)
+    handlers_before = {group: list(hs) for group, hs in app.handlers.items()}
+
+    async def scenario() -> tuple[int, type[Exception] | None]:
+        await app.post_init(app)
+        url = _base_url(started[0])
+        async with httpx.AsyncClient() as client:
+            status = (await client.get(url)).status_code
+            await app.post_shutdown(app)
+            try:
+                await client.get(url)
+                error = None
+            except httpx.ConnectError as exc:
+                error = type(exc)
+        return status, error
+
+    status, error = run(scenario())
+
+    assert status == 200
+    assert error is httpx.ConnectError  # cerrado al apagar el bot
+    assert {g: list(hs) for g, hs in app.handlers.items()} == handlers_before
+
+
+def test_bot_handlers_and_http_server_share_the_event_loop(
+    search: list[tuple[str, float]],
+) -> None:
+    """El bot sigue atendiendo mensajes mientras el servidor responde."""
+
+    async def scenario() -> tuple[int, int]:
+        runner = await bot.start_health_server(0, host="127.0.0.1")
+        context = make_context({"name": "rtx"})
+        update = make_update("600")
+        try:
+            async with httpx.AsyncClient(base_url=_base_url(runner)) as client:
+                state, response = await asyncio.gather(
+                    bot.receive_price(update, context), client.get("/")
+                )
+        finally:
+            await runner.cleanup()
+        return state, response.status_code
+
+    state, status = run(scenario())
+
+    assert state == bot.ASK_ALERT
+    assert status == 200
+    assert search == [("rtx", 600.0)]
+
+
+def test_port_in_use_fails_cleanly() -> None:
+    async def scenario() -> None:
+        first = await bot.start_health_server(0, host="127.0.0.1")
+        try:
+            port = first.addresses[0][1]
+            with pytest.raises(OSError):
+                await bot.start_health_server(port, host="127.0.0.1")
+        finally:
+            await first.cleanup()
+
+    run(scenario())

@@ -1,21 +1,28 @@
 """Bot de Telegram interactivo para buscar productos y crear alertas.
 
-Ejecuta con ``python src/telegram_bot.py``; lee ``TELEGRAM_BOT_TOKEN`` (y
+Ejecuta con ``python -m src.telegram_bot``; lee ``TELEGRAM_BOT_TOKEN`` (y
 opcionalmente ``TELEGRAM_ALLOWED_CHAT_IDS``) del entorno o de ``.env``.
+
+Para desplegarse como Web Service (Render) levanta también un servidor HTTP
+mínimo que responde ``200 OK`` en ``/`` en el puerto ``PORT`` (10000 por
+defecto), en el mismo bucle de eventos que el bot.
 """
 
 import logging
 import os
 import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
 
+from aiohttp import web
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
+    ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -392,6 +399,71 @@ async def stop_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+# --- Servidor HTTP para Render -------------------------------------------------
+
+DEFAULT_PORT = 10000
+HEALTH_HOST = "0.0.0.0"  # Render solo enruta tráfico a interfaces públicas.
+
+
+def health_port(env: Mapping[str, str] = os.environ) -> int:
+    """Puerto de ``PORT`` (lo fija Render) o ``DEFAULT_PORT`` si falta o no vale."""
+    raw = env.get("PORT", "").strip()
+    try:
+        port = int(raw)
+    except ValueError:
+        return DEFAULT_PORT
+    return port if 0 <= port <= 65535 else DEFAULT_PORT
+
+
+async def health(request: web.Request) -> web.Response:
+    """``GET /`` (y ``HEAD /``): responde ``200 OK`` para el health check."""
+    return web.Response(text="OK")
+
+
+def build_health_app() -> web.Application:
+    """App aiohttp mínima: solo ``/``. No toca el bot ni sus datos."""
+    app = web.Application()
+    app.router.add_get("/", health)
+    return app
+
+
+async def start_health_server(port: int, host: str = HEALTH_HOST) -> web.AppRunner:
+    """Arranca el servidor en el bucle de eventos actual y devuelve su runner.
+
+    Con ``port=0`` el sistema elige un puerto libre (útil en tests); el real
+    está en ``runner.addresses``. Se para con ``await runner.cleanup()``.
+    """
+    # Sin log de accesos: Render hace health checks cada pocos segundos.
+    runner = web.AppRunner(build_health_app(), access_log=None)
+    await runner.setup()
+    try:
+        await web.TCPSite(runner, host, port).start()
+    except BaseException:
+        await runner.cleanup()
+        raise
+    logger.info("Servidor HTTP escuchando en %s", runner.addresses)
+    return runner
+
+
+def _with_health_server(builder: ApplicationBuilder, port: int) -> ApplicationBuilder:
+    """Engancha el servidor HTTP al ciclo de vida de la ``Application``.
+
+    ``post_init`` se ejecuta dentro del bucle de ``run_polling`` justo antes de
+    empezar a recibir updates, así que ambos comparten el mismo bucle de
+    eventos; ``post_shutdown`` lo cierra al parar el bot.
+    """
+    runners: list[web.AppRunner] = []
+
+    async def post_init(application: Application) -> None:
+        runners.append(await start_health_server(port))
+
+    async def post_shutdown(application: Application) -> None:
+        while runners:
+            await runners.pop().cleanup()
+
+    return builder.post_init(post_init).post_shutdown(post_shutdown)
+
+
 # --- Aplicación ---------------------------------------------------------------
 
 
@@ -401,16 +473,24 @@ def parse_allowed_chats(raw: str | None) -> set[int]:
 
 
 def build_application(
-    token: str, allowed_chat_ids: set[int] | None = None
+    token: str,
+    allowed_chat_ids: set[int] | None = None,
+    *,
+    http_port: int | None = None,
 ) -> Application:
     """Crea la aplicación del bot con todos sus handlers.
 
     Args:
         token: Token del bot.
         allowed_chat_ids: Si se indica, el bot solo responde a esos chats.
+        http_port: Si se indica, levanta además un servidor HTTP que responde
+            ``200 OK`` en ``/`` mientras el bot está en marcha (Render).
     """
     chats = filters.Chat(chat_id=allowed_chat_ids) if allowed_chat_ids else filters.ALL
-    application = Application.builder().token(token).build()
+    builder = Application.builder().token(token)
+    if http_port is not None:
+        builder = _with_health_server(builder, http_port)
+    application = builder.build()
     application.add_handler(_conversation(chats))
     application.add_handler(CommandHandler("alertas", list_alerts, filters=chats))
     application.add_handler(CommandHandler("parar", stop_alerts, filters=chats))
@@ -473,7 +553,8 @@ def main() -> None:
     if not token:
         raise SystemExit("Define TELEGRAM_BOT_TOKEN en el entorno o en .env")
     allowed = parse_allowed_chats(os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS"))
-    build_application(token, allowed).run_polling(allowed_updates=Update.ALL_TYPES)
+    application = build_application(token, allowed, http_port=health_port())
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
