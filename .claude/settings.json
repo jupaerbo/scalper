@@ -1,5 +1,13 @@
 {
   "permissions": {
+    "allow": [
+      "Bash(uv run pytest*)",
+      "Bash(uv run ruff*)",
+      "Bash(pytest*)",
+      "Bash(ruff*)",
+      "Bash(git status)",
+      "Bash(git diff*)"
+    ],
     "deny": [
       "Read(./.venv/**)",
       "Read(./venv/**)",
@@ -15,7 +23,7 @@
       "Read(./**/*.log)",
       "Read(./**/*.csv)",
       "Read(./**/*.sqlite3)",
-      "Read(./**/*.db)",
+      "Read(./**/*.db)"
     ]
   }
 }
