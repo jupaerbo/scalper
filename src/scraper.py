@@ -9,10 +9,11 @@ import functools
 import html as html_lib
 import json
 import logging
+import os
 import random
 import re
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from functools import cache
 from urllib.parse import urlsplit
@@ -432,6 +433,241 @@ def describe_search_error(exc: Exception) -> str:
     return "no se pudo completar la búsqueda web"
 
 
+_BLOCK_MARKERS = (
+    "403",
+    "forbidden",
+    "captcha",
+    "blocked",
+    "anomaly",
+    "unusual traffic",
+)
+
+
+def is_blocked(exc: BaseException) -> bool:
+    """``True`` si el buscador nos bloquea: rate-limit (429), 403, captcha…
+
+    Los *timeouts* de ``ddgs`` también cuentan: es como suele manifestarse un
+    bloqueo silencioso desde IPs de servidores.
+    """
+    from ddgs.exceptions import TimeoutException
+
+    if is_rate_limit(exc) or isinstance(exc, TimeoutException):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code == 403
+    return any(m in str(exc).casefold() for m in _BLOCK_MARKERS)
+
+
+# --- API de búsqueda de pago (fallback) --------------------------------------
+
+API_TIMEOUT = 10.0
+API_NUM_RESULTS = 20
+API_PROVIDERS = ("serper", "serpapi", "google")
+SERPER_URL = "https://google.serper.dev/search"
+SERPAPI_URL = "https://serpapi.com/search.json"
+GOOGLE_CSE_URL = "https://www.googleapis.com/customsearch/v1"
+_COUNTRY, _LANGUAGE = "es", "es"
+
+
+@dataclass(frozen=True, slots=True)
+class SearchApiConfig:
+    """API de búsqueda configurada por entorno.
+
+    Attributes:
+        provider: ``serper`` (Serper.dev), ``serpapi`` (SerpAPI) o ``google``
+            (Google Custom Search JSON API).
+        api_key: Clave de la API (``SEARCH_API_KEY``).
+        cx: Identificador del buscador programable (solo ``google``).
+    """
+
+    provider: str
+    api_key: str = field(repr=False)
+    cx: str | None = None
+
+
+def search_api_config(env: Mapping[str, str] | None = None) -> SearchApiConfig | None:
+    """Lee ``SEARCH_API_KEY``, ``SEARCH_API_PROVIDER`` (por defecto ``serper``)
+    y, para Google, ``GOOGLE_CSE_ID``.
+
+    Returns:
+        La configuración, o ``None`` si no hay clave o está incompleta.
+    """
+    env = os.environ if env is None else env
+    key = env.get("SEARCH_API_KEY", "").strip()
+    if not key:
+        return None
+    provider = env.get("SEARCH_API_PROVIDER", "").strip().lower() or "serper"
+    if provider not in API_PROVIDERS:
+        logger.warning(
+            "SEARCH_API_PROVIDER=%r no válido (usa %s); API desactivada",
+            provider,
+            ", ".join(API_PROVIDERS),
+        )
+        return None
+    cx = env.get("GOOGLE_CSE_ID", "").strip() or None
+    if provider == "google" and cx is None:
+        logger.warning("Google Custom Search necesita GOOGLE_CSE_ID; API desactivada")
+        return None
+    return SearchApiConfig(provider, key, cx)
+
+
+def _price_text(price: object, currency: object = "") -> str:
+    """``"649.0 EUR"`` para que ``extract_price_and_currency`` lo reconozca."""
+    text = str(price if price is not None else "").strip()
+    if not text:
+        return ""
+    if re.search(r"[€$]|\b(?:eur|usd)\b", text, re.IGNORECASE):
+        return f" {text}"  # ya trae la moneda: "€649.00", "649 EUR"
+    symbol = str(currency or "").strip()
+    code = {"€": "EUR", "$": "USD", "US$": "USD"}.get(symbol, symbol.upper())
+    return f" {text} {code or 'EUR'}"
+
+
+def _stock_text(availability: object) -> str:
+    known = _availability(availability)
+    return "" if known is None else (" En stock" if known else " Agotado")
+
+
+def _from_serper(data: Mapping) -> list[dict[str, str]]:
+    results = []
+    for item in data.get("organic") or []:
+        body = (item.get("snippet") or "") + _price_text(
+            item.get("price"), item.get("currency")
+        )
+        results.append(
+            {"title": item.get("title", ""), "href": item.get("link", ""), "body": body}
+        )
+    return results
+
+
+def _from_serpapi(data: Mapping) -> list[dict[str, str]]:
+    results = []
+    for item in data.get("organic_results") or []:
+        top = (item.get("rich_snippet") or {}).get("top") or {}
+        detected = top.get("detected_extensions") or {}
+        extras = " ".join(str(e) for e in top.get("extensions") or [])
+        body = " ".join(
+            filter(
+                None,
+                [
+                    item.get("snippet") or "",
+                    _price_text(detected.get("price"), detected.get("currency")),
+                    extras,
+                ],
+            )
+        )
+        results.append(
+            {"title": item.get("title", ""), "href": item.get("link", ""), "body": body}
+        )
+    return results
+
+
+def _from_google(data: Mapping) -> list[dict[str, str]]:
+    results = []
+    for item in data.get("items") or []:
+        offers = (item.get("pagemap") or {}).get("offer") or [{}]
+        offer = offers[0] if isinstance(offers[0], dict) else {}
+        body = (
+            (item.get("snippet") or "")
+            + _price_text(offer.get("price"), offer.get("pricecurrency"))
+            + _stock_text(offer.get("availability"))
+        )
+        results.append(
+            {"title": item.get("title", ""), "href": item.get("link", ""), "body": body}
+        )
+    return results
+
+
+def _api_request(query: str, config: SearchApiConfig) -> httpx.Request:
+    """Petición HTTP de cada proveedor (Serper usa POST; SerpAPI y Google,
+    que solo admiten GET, llevan la clave como parámetro)."""
+    if config.provider == "serper":
+        return httpx.Request(
+            "POST",
+            SERPER_URL,
+            headers={"X-API-KEY": config.api_key},
+            json={
+                "q": query,
+                "gl": _COUNTRY,
+                "hl": _LANGUAGE,
+                "num": API_NUM_RESULTS,
+            },
+        )
+    if config.provider == "serpapi":
+        params = {
+            "engine": "google",
+            "q": query,
+            "google_domain": "google.es",
+            "gl": _COUNTRY,
+            "hl": _LANGUAGE,
+            "num": API_NUM_RESULTS,
+            "api_key": config.api_key,
+        }
+        return httpx.Request("GET", SERPAPI_URL, params=params)
+    params = {
+        "q": query,
+        "cx": config.cx or "",
+        "gl": _COUNTRY,
+        "hl": _LANGUAGE,
+        "num": 10,  # máximo de Google Custom Search
+        "key": config.api_key,
+    }
+    return httpx.Request("GET", GOOGLE_CSE_URL, params=params)
+
+
+_API_PARSERS: dict[str, Callable[[Mapping], list[dict[str, str]]]] = {
+    "serper": _from_serper,
+    "serpapi": _from_serpapi,
+    "google": _from_google,
+}
+
+
+async def api_search(
+    query: str,
+    config: SearchApiConfig,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> list[dict[str, str]]:
+    """Busca ``query`` en la API configurada.
+
+    Devuelve los resultados en el mismo formato que ``ddgs``
+    (``{title, href, body}``), con el precio y el stock estructurados de la
+    API añadidos al ``body`` para que los procese ``parse_web_result``.
+
+    Raises:
+        httpx.HTTPError: Si la API falla (clave inválida, cuota, red…).
+        ValueError: Si la respuesta no es JSON.
+    """
+    request = _api_request(query, config)
+    if client is None:
+        async with httpx.AsyncClient(timeout=API_TIMEOUT) as owned:
+            response = await owned.send(request)
+    else:
+        response = await client.send(request)
+    response.raise_for_status()
+    results = _API_PARSERS[config.provider](response.json())
+    logger.info("API %s: %d resultado(s) para %r", config.provider, len(results), query)
+    return results
+
+
+def describe_api_error(exc: Exception) -> str:
+    """Motivo del fallo de la API **sin** la URL (puede llevar la clave)."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        reason = {
+            400: "petición no válida",
+            401: "clave no válida",
+            403: "clave no válida o sin permisos",
+            429: "cuota o límite de peticiones agotado",
+        }.get(code, "error del servidor")
+        return f"HTTP {code}: {reason}"
+    if isinstance(exc, httpx.TimeoutException):
+        return "tiempo de espera agotado"
+    if isinstance(exc, httpx.HTTPError):
+        return f"error de red ({type(exc).__name__})"
+    return f"respuesta no válida ({type(exc).__name__})"
+
+
 async def search_products(
     name: str,
     max_price: float,
@@ -441,6 +677,7 @@ async def search_products(
     limit: int = MAX_PRODUCTS,
     inspect_pages: bool = True,
     page_client: httpx.AsyncClient | None = None,
+    api_client: httpx.AsyncClient | None = None,
 ) -> list[Product]:
     """Busca ``name`` en todo internet (DuckDuckGo) y filtra por precio.
 
@@ -465,6 +702,7 @@ async def search_products(
             el HTML el precio actual, rebajas incluidas
             (``enrich_with_page_prices``).
         page_client: Cliente HTTP para esas páginas; útil en tests.
+        api_client: Cliente HTTP para la API de búsqueda; útil en tests.
 
     Returns:
         Hasta ``limit`` ofertas con ``price <= max_price`` y sin URLs
@@ -473,12 +711,15 @@ async def search_products(
 
     Cada consulta se reintenta con backoff exponencial (``run_search``). Si
     las consultas de ``build_queries`` no dan ningún resultado útil, se
-    prueban las de ``relaxed_queries``.
+    prueban las de ``relaxed_queries``. Si aun así no hay nada, o los
+    buscadores están bloqueados (403, 429, captcha…), y ``SEARCH_API_KEY``
+    está definida, se consulta la API de búsqueda (``api_search``).
 
     Raises:
         ValueError: Si ``name`` está vacío o ``max_price`` es negativo.
         SearchError: Si la primera consulta falla tras sus reintentos (red,
-            DNS, rate-limit…). Si falla una posterior se devuelve lo reunido.
+            DNS, rate-limit…) y la API (si la hay) tampoco da resultados. Si
+            falla una posterior se devuelve lo reunido.
     """
     name = name.strip()
     if not name:
@@ -512,8 +753,12 @@ async def search_products(
             ):
                 over_budget.setdefault(product.url, result)
 
-    async def run_queries(queries: list[str], *, strict: bool) -> bool:
-        """Lanza las consultas en orden; ``False`` si hubo que abortar."""
+    def found_nothing() -> bool:
+        return not (offers or priceless or over_budget)
+
+    async def run_queries(queries: list[str]) -> tuple[Exception, int] | None:
+        """Lanza las consultas en orden; devuelve ``(error, índice)`` si
+        hubo que abortar (tras un rate-limit, insistir empeora el bloqueo)."""
         for index, query in enumerate(queries):
             try:
                 ingest(await run_search(query, search_fn))
@@ -524,23 +769,44 @@ async def search_products(
                     describe_search_error(exc),
                     exc,
                 )
-                if strict and index == 0:
-                    raise SearchError(describe_search_error(exc)) from exc
-                # Tras un rate-limit, insistir solo empeora el bloqueo.
-                return False
+                return exc, index
             if len(offers) >= MIN_PRODUCTS:
                 break
-        return True
+        return None
 
     queries = build_queries(name)
-    healthy = await run_queries(queries, strict=True)
-    if healthy and not (offers or priceless or over_budget):
+    failure = await run_queries(queries)
+    if failure is None and found_nothing():
         # 0 resultados útiles: se relaja la consulta (sin términos de compra,
         # símbolos ni detalles) para encontrar al menos algunas ofertas.
         fallback = [q for q in relaxed_queries(name) if q not in queries]
         if fallback:
             logger.info("Sin resultados; probando consultas flexibles: %s", fallback)
-            await run_queries(fallback, strict=False)
+            failure = await run_queries(fallback)
+            if failure is not None:
+                failure = (failure[0], -1)  # no es la consulta principal
+
+    blocked = failure is not None and is_blocked(failure[0])
+    if found_nothing() and (failure is None or blocked):
+        api = search_api_config()
+        if api is not None:
+            logger.warning(
+                "Buscadores sin resultados%s; usando la API de búsqueda (%s)",
+                " (bloqueo/rate-limit)" if blocked else "",
+                api.provider,
+            )
+            try:
+                ingest(await api_search(queries[0], api, client=api_client))
+            except Exception as exc:
+                logger.warning(
+                    "La API de búsqueda (%s) también falló: %s",
+                    api.provider,
+                    describe_api_error(exc),
+                )
+
+    if failure is not None and failure[1] == 0 and found_nothing():
+        exc = failure[0]
+        raise SearchError(describe_search_error(exc)) from exc
 
     pending = [
         result for url, result in (priceless | over_budget).items() if url not in offers

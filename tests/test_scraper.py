@@ -89,6 +89,13 @@ def no_backoff_waits(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(scraper, "BACKOFF_BASE", 0.0)
 
 
+@pytest.fixture(autouse=True)
+def no_search_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    """La API de pago está desactivada salvo que el test la configure."""
+    for var in ("SEARCH_API_KEY", "SEARCH_API_PROVIDER", "GOOGLE_CSE_ID"):
+        monkeypatch.delenv(var, raising=False)
+
+
 def _search(
     max_price: float, results: list[dict[str, str]] = WEB_RESULTS, **kwargs: bool
 ) -> tuple[list[Product], list[str]]:
@@ -1458,3 +1465,419 @@ def test_identity_is_kept_across_redirects() -> None:
 
     assert len(sent) == 2
     assert sent[0]["User-Agent"] == sent[1]["User-Agent"]
+
+
+# --- API de búsqueda de pago (fallback) -----------------------------------------
+
+from scraper import (  # noqa: E402
+    SearchApiConfig,
+    api_search,
+    describe_api_error,
+    is_blocked,
+    search_api_config,
+)
+
+API_KEY = "test-api-key-123"
+
+SERPER_RESPONSE = {
+    "organic": [
+        {
+            "title": "MSI RTX 4070 Ventus | PcTienda",
+            "link": "https://pctienda.es/msi-rtx-4070",
+            "snippet": "Tarjeta gráfica MSI. En stock.",
+            "price": 649.0,
+            "currency": "€",
+        },
+        {
+            "title": "RTX 4070 Eagle - Otra",
+            "link": "https://otra.es/eagle",
+            "snippet": "Ahora 599,90 € envío gratis",
+        },
+    ]
+}
+SERPAPI_RESPONSE = {
+    "organic_results": [
+        {
+            "title": "RTX 4070 Dual",
+            "link": "https://serp.es/dual",
+            "snippet": "Gráfica ASUS Dual.",
+            "rich_snippet": {
+                "top": {
+                    "detected_extensions": {"price": 579.0, "currency": "€"},
+                    "extensions": ["579,00 €", "Agotado"],
+                }
+            },
+        }
+    ]
+}
+GOOGLE_RESPONSE = {
+    "items": [
+        {
+            "title": "RTX 4070 Gaming OC",
+            "link": "https://google-shop.es/oc",
+            "snippet": "Gigabyte Gaming OC 12 GB.",
+            "pagemap": {
+                "offer": [
+                    {
+                        "price": "629.00",
+                        "pricecurrency": "EUR",
+                        "availability": "https://schema.org/InStock",
+                    }
+                ]
+            },
+        }
+    ]
+}
+
+
+def _api_client(
+    response: httpx.Response | Exception, requests: list[httpx.Request] | None = None
+) -> httpx.AsyncClient:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if requests is not None:
+            requests.append(request)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+def _enable_api(
+    monkeypatch: pytest.MonkeyPatch, provider: str = "serper", **extra: str
+) -> None:
+    monkeypatch.setenv("SEARCH_API_KEY", API_KEY)
+    monkeypatch.setenv("SEARCH_API_PROVIDER", provider)
+    for name, value in extra.items():
+        monkeypatch.setenv(name, value)
+
+
+def _search_with_api(
+    search_fn: scraper.SearchFn,
+    response: httpx.Response | Exception,
+    requests: list[httpx.Request] | None = None,
+    max_price: float = 1000.0,
+) -> list[Product]:
+    async def run() -> list[Product]:
+        async with _api_client(response, requests) as client:
+            return await search_products(
+                "rtx 4070", max_price, search_fn=search_fn, api_client=client
+            )
+
+    return asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({}, None),
+        ({"SEARCH_API_KEY": "  "}, None),
+        ({"SEARCH_API_KEY": "k"}, SearchApiConfig("serper", "k")),
+        (
+            {"SEARCH_API_KEY": "k", "SEARCH_API_PROVIDER": "SerpAPI"},
+            SearchApiConfig("serpapi", "k"),
+        ),
+        (
+            {
+                "SEARCH_API_KEY": "k",
+                "SEARCH_API_PROVIDER": "google",
+                "GOOGLE_CSE_ID": "cx1",
+            },
+            SearchApiConfig("google", "k", "cx1"),
+        ),
+        ({"SEARCH_API_KEY": "k", "SEARCH_API_PROVIDER": "google"}, None),
+        ({"SEARCH_API_KEY": "k", "SEARCH_API_PROVIDER": "bing"}, None),
+    ],
+)
+def test_search_api_config(
+    env: dict[str, str], expected: SearchApiConfig | None
+) -> None:
+    assert search_api_config(env) == expected
+
+
+def test_search_api_config_never_shows_the_key() -> None:
+    assert API_KEY not in repr(SearchApiConfig("serper", API_KEY))
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (RatelimitException("x"), True),
+        (DDGSException("https://html.duckduckgo.com 403 Forbidden"), True),
+        (DDGSException("captcha required"), True),
+        (RuntimeError("If this error persists, please let us know: anomaly"), True),
+        (
+            httpx.HTTPStatusError(
+                "x",
+                request=httpx.Request("GET", "https://a.test"),
+                response=httpx.Response(403),
+            ),
+            True,
+        ),
+        (OSError("[Errno 11001] getaddrinfo failed"), False),
+        (RuntimeError("algo raro"), False),
+    ],
+)
+def test_is_blocked(error: Exception, expected: bool) -> None:
+    assert is_blocked(error) is expected
+
+
+def test_serper_request_is_a_post_with_header_key() -> None:
+    requests: list[httpx.Request] = []
+
+    async def run() -> list[dict[str, str]]:
+        response = httpx.Response(200, json=SERPER_RESPONSE)
+        async with _api_client(response, requests) as client:
+            return await api_search(
+                "rtx 4070", SearchApiConfig("serper", API_KEY), client=client
+            )
+
+    results = asyncio.run(run())
+
+    (request,) = requests
+    assert request.method == "POST"
+    assert str(request.url) == scraper.SERPER_URL
+    assert request.headers["X-API-KEY"] == API_KEY
+    import json
+
+    assert json.loads(request.content) == {
+        "q": "rtx 4070",
+        "gl": "es",
+        "hl": "es",
+        "num": scraper.API_NUM_RESULTS,
+    }
+    assert results[0]["href"] == "https://pctienda.es/msi-rtx-4070"
+    assert "649.0 EUR" in results[0]["body"]
+
+
+@pytest.mark.parametrize(
+    ("config", "response", "url", "product"),
+    [
+        (
+            SearchApiConfig("serper", API_KEY),
+            SERPER_RESPONSE,
+            "https://pctienda.es/msi-rtx-4070",
+            Product(
+                "MSI RTX 4070 Ventus",
+                649.0,
+                True,
+                "pctienda.es",
+                "https://pctienda.es/msi-rtx-4070",
+            ),
+        ),
+        (
+            SearchApiConfig("serpapi", API_KEY),
+            SERPAPI_RESPONSE,
+            "https://serp.es/dual",
+            Product("RTX 4070 Dual", 579.0, False, "serp.es", "https://serp.es/dual"),
+        ),
+        (
+            SearchApiConfig("google", API_KEY, "cx1"),
+            GOOGLE_RESPONSE,
+            "https://google-shop.es/oc",
+            Product(
+                "RTX 4070 Gaming OC",
+                629.0,
+                True,
+                "google-shop.es",
+                "https://google-shop.es/oc",
+            ),
+        ),
+    ],
+)
+def test_api_results_become_products(
+    config: SearchApiConfig, response: dict, url: str, product: Product
+) -> None:
+    async def run() -> list[dict[str, str]]:
+        async with _api_client(httpx.Response(200, json=response)) as client:
+            return await api_search("rtx 4070", config, client=client)
+
+    results = asyncio.run(run())
+    parsed = {r["href"]: parse_web_result(r) for r in results}
+
+    assert parsed[url] == product
+
+
+def test_serpapi_and_google_send_key_as_query_param() -> None:
+    for config, base in (
+        (SearchApiConfig("serpapi", API_KEY), scraper.SERPAPI_URL),
+        (SearchApiConfig("google", API_KEY, "cx1"), scraper.GOOGLE_CSE_URL),
+    ):
+        request = scraper._api_request("rtx 4070", config)
+        assert str(request.url).startswith(base)
+        assert API_KEY in request.url.params.values()
+        assert request.url.params["q"] == "rtx 4070"
+
+
+def test_api_is_used_when_ddgs_is_rate_limited(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _enable_api(monkeypatch)
+    fn = _Scripted(*[RatelimitException("202 Ratelimit")] * SEARCH_ATTEMPTS)
+    requests: list[httpx.Request] = []
+
+    with caplog.at_level(logging.WARNING, logger="scraper"):
+        products = _search_with_api(
+            fn, httpx.Response(200, json=SERPER_RESPONSE), requests
+        )
+
+    assert [p.price for p in products] == [649.0, 599.9]
+    assert len(requests) == 1
+    assert json_query(requests[0]) == build_queries("rtx 4070")[0]
+    assert "API de búsqueda" in caplog.text
+    assert API_KEY not in caplog.text
+
+
+def json_query(request: httpx.Request) -> str:
+    import json
+
+    return json.loads(request.content)["q"]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        DDGSException("https://html.duckduckgo.com/html 403 Forbidden"),
+        DDGSException("Captcha detected"),
+        httpx.HTTPStatusError(
+            "x",
+            request=httpx.Request("GET", "https://duckduckgo.com"),
+            response=httpx.Response(429),
+        ),
+    ],
+)
+def test_api_is_used_on_403_429_and_captcha(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    _enable_api(monkeypatch)
+    fn = _Scripted(*[error] * SEARCH_ATTEMPTS)
+
+    products = _search_with_api(fn, httpx.Response(200, json=SERPER_RESPONSE))
+
+    assert len(products) == 2
+
+
+def test_api_is_used_when_every_query_returns_zero_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_api(monkeypatch)
+    fn = _Scripted()  # siempre []
+    requests: list[httpx.Request] = []
+
+    products = _search_with_api(fn, httpx.Response(200, json=SERPER_RESPONSE), requests)
+
+    assert len(products) == 2
+    assert len(requests) == 1
+    # Antes de pagar la API se agotan las consultas normales y las flexibles.
+    assert set(build_queries("rtx 4070")) | set(relaxed_queries("rtx 4070")) <= set(
+        fn.queries
+    )
+
+
+def test_api_is_not_used_when_ddgs_works(monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable_api(monkeypatch)
+    requests: list[httpx.Request] = []
+
+    products = _search_with_api(
+        _Scripted([_offer(1)]), httpx.Response(200, json=SERPER_RESPONSE), requests
+    )
+
+    assert [p.store_name for p in products] == ["tienda1.es"]
+    assert requests == []
+
+
+def test_api_is_not_used_for_dns_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable_api(monkeypatch)
+    fn = _Scripted(*[OSError("[Errno 11001] getaddrinfo failed")] * SEARCH_ATTEMPTS)
+    requests: list[httpx.Request] = []
+
+    with pytest.raises(SearchError, match="DNS"):
+        _search_with_api(fn, httpx.Response(200, json=SERPER_RESPONSE), requests)
+
+    assert requests == []
+
+
+def test_without_api_key_rate_limit_still_raises_search_error() -> None:
+    fn = _Scripted(*[RatelimitException("x")] * SEARCH_ATTEMPTS)
+    requests: list[httpx.Request] = []
+
+    with pytest.raises(SearchError, match="limitado"):
+        _search_with_api(fn, httpx.Response(200, json=SERPER_RESPONSE), requests)
+
+    assert requests == []
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(401, json={"message": f"Unauthorized {API_KEY}"}),
+        httpx.Response(429),
+        httpx.Response(200, text="<html>no es json</html>"),
+        httpx.ConnectError("boom"),
+    ],
+)
+def test_api_failure_after_block_is_a_clean_search_error(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    response: httpx.Response | Exception,
+) -> None:
+    _enable_api(monkeypatch, "serpapi")  # la clave va en la URL: no debe filtrarse
+    fn = _Scripted(*[RatelimitException("x")] * SEARCH_ATTEMPTS)
+
+    with (
+        caplog.at_level(logging.INFO, logger="scraper"),
+        pytest.raises(SearchError, match="limitado"),
+    ):
+        _search_with_api(fn, response)
+
+    assert "también falló" in caplog.text
+    assert API_KEY not in caplog.text
+
+
+def test_api_failure_after_zero_results_returns_empty_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_api(monkeypatch)
+
+    assert _search_with_api(_Scripted(), httpx.Response(500)) == []
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            httpx.HTTPStatusError(
+                "x",
+                request=httpx.Request("GET", f"https://serpapi.com/?api_key={API_KEY}"),
+                response=httpx.Response(401),
+            ),
+            "HTTP 401: clave no válida",
+        ),
+        (
+            httpx.HTTPStatusError(
+                "x",
+                request=httpx.Request("GET", "https://a.test"),
+                response=httpx.Response(429),
+            ),
+            "HTTP 429: cuota o límite de peticiones agotado",
+        ),
+        (httpx.ReadTimeout("t"), "tiempo de espera agotado"),
+        (ValueError("bad json"), "respuesta no válida (ValueError)"),
+    ],
+)
+def test_describe_api_error_hides_url(error: Exception, expected: str) -> None:
+    message = describe_api_error(error)
+
+    assert message == expected
+    assert API_KEY not in message
+
+
+def test_api_price_respects_max_price(monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable_api(monkeypatch)
+    fn = _Scripted(*[RatelimitException("x")] * SEARCH_ATTEMPTS)
+
+    products = _search_with_api(
+        fn, httpx.Response(200, json=SERPER_RESPONSE), max_price=600.0
+    )
+
+    assert [p.price for p in products] == [599.9]
