@@ -709,17 +709,20 @@ async def search_products(
         repetidas: primero con stock, luego sin confirmar y por último
         agotadas; cada grupo por precio.
 
-    Cada consulta se reintenta con backoff exponencial (``run_search``). Si
-    las consultas de ``build_queries`` no dan ningún resultado útil, se
-    prueban las de ``relaxed_queries``. Si aun así no hay nada, o los
-    buscadores están bloqueados (403, 429, captcha…), y ``SEARCH_API_KEY``
-    está definida, se consulta la API de búsqueda (``api_search``).
+    Motores, por orden:
+
+    1. Si ``SEARCH_API_KEY`` está definida, la API de búsqueda
+       (``api_search``, Serper por defecto) es el motor principal.
+    2. Si no hay clave, la API falla o no da ningún resultado útil, ``ddgs``:
+       cada consulta se reintenta con backoff exponencial (``run_search``) y,
+       si las de ``build_queries`` no dan nada, se prueban las de
+       ``relaxed_queries``.
 
     Raises:
         ValueError: Si ``name`` está vacío o ``max_price`` es negativo.
-        SearchError: Si la primera consulta falla tras sus reintentos (red,
-            DNS, rate-limit…) y la API (si la hay) tampoco da resultados. Si
-            falla una posterior se devuelve lo reunido.
+        SearchError: Si no hay resultados y la primera consulta de ``ddgs``
+            falla tras sus reintentos (red, DNS, rate-limit…). Si falla una
+            posterior se devuelve lo reunido.
     """
     name = name.strip()
     if not name:
@@ -775,34 +778,38 @@ async def search_products(
         return None
 
     queries = build_queries(name)
-    failure = await run_queries(queries)
-    if failure is None and found_nothing():
-        # 0 resultados útiles: se relaja la consulta (sin términos de compra,
-        # símbolos ni detalles) para encontrar al menos algunas ofertas.
-        fallback = [q for q in relaxed_queries(name) if q not in queries]
-        if fallback:
-            logger.info("Sin resultados; probando consultas flexibles: %s", fallback)
-            failure = await run_queries(fallback)
-            if failure is not None:
-                failure = (failure[0], -1)  # no es la consulta principal
+    failure: tuple[Exception, int] | None = None
 
-    blocked = failure is not None and is_blocked(failure[0])
-    if found_nothing() and (failure is None or blocked):
-        api = search_api_config()
-        if api is not None:
+    # 1) Motor principal: la API de búsqueda, si hay SEARCH_API_KEY. Una sola
+    #    llamada por búsqueda para no gastar cuota.
+    if (api := search_api_config()) is not None:
+        try:
+            ingest(await api_search(queries[0], api, client=api_client))
+        except Exception as exc:
             logger.warning(
-                "Buscadores sin resultados%s; usando la API de búsqueda (%s)",
-                " (bloqueo/rate-limit)" if blocked else "",
+                "La API de búsqueda (%s) falló: %s; usando ddgs",
                 api.provider,
+                describe_api_error(exc),
             )
-            try:
-                ingest(await api_search(queries[0], api, client=api_client))
-            except Exception as exc:
-                logger.warning(
-                    "La API de búsqueda (%s) también falló: %s",
-                    api.provider,
-                    describe_api_error(exc),
+        else:
+            if found_nothing():
+                logger.info("La API (%s) no dio resultados; usando ddgs", api.provider)
+
+    # 2) Fallback (o motor único sin clave): ddgs con reintentos y consultas
+    #    flexibles si no hay nada útil.
+    if found_nothing():
+        failure = await run_queries(queries)
+        if failure is None and found_nothing():
+            # 0 resultados útiles: se relaja la consulta (sin términos de
+            # compra, símbolos ni detalles) para encontrar algunas ofertas.
+            fallback = [q for q in relaxed_queries(name) if q not in queries]
+            if fallback:
+                logger.info(
+                    "Sin resultados; probando consultas flexibles: %s", fallback
                 )
+                failure = await run_queries(fallback)
+                if failure is not None:
+                    failure = (failure[0], -1)  # no es la consulta principal
 
     if failure is not None and failure[1] == 0 and found_nothing():
         exc = failure[0]

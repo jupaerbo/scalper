@@ -139,7 +139,7 @@ repositorio** (ya está en `.gitignore`).
 | `PORT` | — | Puerto del health check HTTP. Por defecto `10000`; en Render se define automáticamente. |
 | `TELEGRAM_ALLOWED_CHAT_IDS` | — | IDs de chat autorizados, separados por comas. Vacío = cualquiera puede usar el bot. |
 | `DDGS_PROXY` | — | Proxy para el buscador (`http://usuario:clave@host:puerto`). Útil si la IP del servidor sufre *rate-limit*. |
-| `SEARCH_API_KEY` | — | Clave de una API de búsqueda de pago, usada **solo** si los buscadores gratuitos dan 0 resultados o bloquean (403, 429, captcha). |
+| `SEARCH_API_KEY` | — | Clave de una API de búsqueda de pago. Si está definida es el **motor principal** (1 llamada por búsqueda); si falla o no da resultados, se usa `ddgs`. |
 | `SEARCH_API_PROVIDER` | — | `serper` (por defecto, [Serper.dev](https://serper.dev)), `serpapi` ([SerpAPI](https://serpapi.com)) o `google` ([Custom Search](https://developers.google.com/custom-search/v1/overview)). |
 | `GOOGLE_CSE_ID` | — | ID del buscador programable; obligatorio con `SEARCH_API_PROVIDER=google`. |
 | `NOTIFY_EMAIL`, `SMTP_*` | — | Alertas por email desde la CLI (ver `.env.example`). |
@@ -241,7 +241,7 @@ En **Environment** añade:
 | `PYTHON_VERSION` | Una versión ≥ 3.12, p. ej. `3.13.4` |
 | `TELEGRAM_ALLOWED_CHAT_IDS` | *(opcional)* tus IDs de chat |
 | `DDGS_PROXY` | *(opcional)* proxy si el buscador limita la IP de Render |
-| `SEARCH_API_KEY` | *(opcional, recomendado en Render)* API de respaldo si los buscadores bloquean la IP |
+| `SEARCH_API_KEY` | *(opcional, recomendado en Render)* API de búsqueda como motor principal, inmune a los bloqueos por IP |
 
 `PORT` lo inyecta Render automáticamente; no hace falta definirlo.
 

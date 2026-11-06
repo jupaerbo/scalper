@@ -1709,91 +1709,35 @@ def test_serpapi_and_google_send_key_as_query_param() -> None:
         assert request.url.params["q"] == "rtx 4070"
 
 
-def test_api_is_used_when_ddgs_is_rate_limited(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    _enable_api(monkeypatch)
-    fn = _Scripted(*[RatelimitException("202 Ratelimit")] * SEARCH_ATTEMPTS)
-    requests: list[httpx.Request] = []
-
-    with caplog.at_level(logging.WARNING, logger="scraper"):
-        products = _search_with_api(
-            fn, httpx.Response(200, json=SERPER_RESPONSE), requests
-        )
-
-    assert [p.price for p in products] == [649.0, 599.9]
-    assert len(requests) == 1
-    assert json_query(requests[0]) == build_queries("rtx 4070")[0]
-    assert "API de búsqueda" in caplog.text
-    assert API_KEY not in caplog.text
-
-
 def json_query(request: httpx.Request) -> str:
     import json
 
     return json.loads(request.content)["q"]
 
 
-@pytest.mark.parametrize(
-    "error",
-    [
-        DDGSException("https://html.duckduckgo.com/html 403 Forbidden"),
-        DDGSException("Captcha detected"),
-        httpx.HTTPStatusError(
-            "x",
-            request=httpx.Request("GET", "https://duckduckgo.com"),
-            response=httpx.Response(429),
-        ),
-    ],
-)
-def test_api_is_used_on_403_429_and_captcha(
-    monkeypatch: pytest.MonkeyPatch, error: Exception
-) -> None:
-    _enable_api(monkeypatch)
-    fn = _Scripted(*[error] * SEARCH_ATTEMPTS)
-
-    products = _search_with_api(fn, httpx.Response(200, json=SERPER_RESPONSE))
-
-    assert len(products) == 2
-
-
-def test_api_is_used_when_every_query_returns_zero_results(
+def test_api_is_the_primary_engine_when_key_is_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enable_api(monkeypatch)
-    fn = _Scripted()  # siempre []
+    fn = _Scripted([_offer(1)])  # ddgs funcionaría, pero no se usa
     requests: list[httpx.Request] = []
 
     products = _search_with_api(fn, httpx.Response(200, json=SERPER_RESPONSE), requests)
 
-    assert len(products) == 2
-    assert len(requests) == 1
-    # Antes de pagar la API se agotan las consultas normales y las flexibles.
-    assert set(build_queries("rtx 4070")) | set(relaxed_queries("rtx 4070")) <= set(
-        fn.queries
-    )
+    # 649 € va primero por estar "En stock"; 599,90 € tiene stock sin confirmar.
+    assert [p.price for p in products] == [649.0, 599.9]
+    assert len(requests) == 1  # una sola llamada: no gasta cuota de más
+    assert json_query(requests[0]) == build_queries("rtx 4070")[0]
+    assert fn.queries == []
 
 
-def test_api_is_not_used_when_ddgs_works(monkeypatch: pytest.MonkeyPatch) -> None:
-    _enable_api(monkeypatch)
+def test_without_api_key_ddgs_is_used_and_api_never_called() -> None:
+    fn = _Scripted([_offer(1)])
     requests: list[httpx.Request] = []
 
-    products = _search_with_api(
-        _Scripted([_offer(1)]), httpx.Response(200, json=SERPER_RESPONSE), requests
-    )
+    products = _search_with_api(fn, httpx.Response(200, json=SERPER_RESPONSE), requests)
 
     assert [p.store_name for p in products] == ["tienda1.es"]
-    assert requests == []
-
-
-def test_api_is_not_used_for_dns_errors(monkeypatch: pytest.MonkeyPatch) -> None:
-    _enable_api(monkeypatch)
-    fn = _Scripted(*[OSError("[Errno 11001] getaddrinfo failed")] * SEARCH_ATTEMPTS)
-    requests: list[httpx.Request] = []
-
-    with pytest.raises(SearchError, match="DNS"):
-        _search_with_api(fn, httpx.Response(200, json=SERPER_RESPONSE), requests)
-
     assert requests == []
 
 
@@ -1811,30 +1755,94 @@ def test_without_api_key_rate_limit_still_raises_search_error() -> None:
     "response",
     [
         httpx.Response(401, json={"message": f"Unauthorized {API_KEY}"}),
+        httpx.Response(403),
         httpx.Response(429),
+        httpx.Response(500),
         httpx.Response(200, text="<html>no es json</html>"),
         httpx.ConnectError("boom"),
+        httpx.ReadTimeout("timeout"),
     ],
 )
-def test_api_failure_after_block_is_a_clean_search_error(
+def test_api_failure_falls_back_to_ddgs(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     response: httpx.Response | Exception,
 ) -> None:
     _enable_api(monkeypatch, "serpapi")  # la clave va en la URL: no debe filtrarse
-    fn = _Scripted(*[RatelimitException("x")] * SEARCH_ATTEMPTS)
+    fn = _Scripted([_offer(1)])
 
-    with (
-        caplog.at_level(logging.INFO, logger="scraper"),
-        pytest.raises(SearchError, match="limitado"),
-    ):
-        _search_with_api(fn, response)
+    with caplog.at_level(logging.INFO, logger="scraper"):
+        products = _search_with_api(fn, response)
 
-    assert "también falló" in caplog.text
+    assert [p.store_name for p in products] == ["tienda1.es"]
+    assert fn.queries[0] == build_queries("rtx 4070")[0]
+    assert "usando ddgs" in caplog.text
     assert API_KEY not in caplog.text
 
 
-def test_api_failure_after_zero_results_returns_empty_list(
+def test_api_without_results_falls_back_to_ddgs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_api(monkeypatch)
+    fn = _Scripted([_offer(1)])
+
+    products = _search_with_api(fn, httpx.Response(200, json={"organic": []}))
+
+    assert [p.store_name for p in products] == ["tienda1.es"]
+    assert fn.queries[0] == build_queries("rtx 4070")[0]
+
+
+def test_api_results_with_only_pages_to_inspect_do_not_fall_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Un resultado sin precio en el snippet es útil (se inspecciona su página)."""
+    _enable_api(monkeypatch)
+    fn = _Scripted([_offer(1)])
+    response = {"organic": [{"title": "RTX 4070", "link": "https://t1.es/p"}]}
+
+    async def run() -> list[Product]:
+        async with (
+            _api_client(httpx.Response(200, json=response)) as api,
+            _page_client({"https://t1.es/p": _html(HTML_OG)}) as pages,
+        ):
+            return await search_products(
+                "rtx 4070", 1000.0, search_fn=fn, api_client=api, page_client=pages
+            )
+
+    products = asyncio.run(run())
+
+    assert [(p.url, p.price) for p in products] == [("https://t1.es/p", 589.9)]
+    assert fn.queries == []
+
+
+def test_api_failure_and_ddgs_block_is_a_clean_search_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _enable_api(monkeypatch, "serpapi")
+    fn = _Scripted(*[RatelimitException("x")] * SEARCH_ATTEMPTS)
+
+    with (
+        caplog.at_level(logging.WARNING, logger="scraper"),
+        pytest.raises(SearchError, match="limitado"),
+    ):
+        _search_with_api(fn, httpx.Response(429))
+
+    assert "La API de búsqueda (serpapi) falló: HTTP 429" in caplog.text
+    assert "rate-limit" in caplog.text
+    assert API_KEY not in caplog.text
+
+
+def test_api_failure_and_ddgs_dns_error_is_a_clean_search_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_api(monkeypatch)
+    fn = _Scripted(*[OSError("[Errno 11001] getaddrinfo failed")] * SEARCH_ATTEMPTS)
+
+    with pytest.raises(SearchError, match="DNS"):
+        _search_with_api(fn, httpx.ConnectError("[Errno 11001] getaddrinfo failed"))
+
+
+def test_api_failure_and_ddgs_zero_results_returns_empty_list(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enable_api(monkeypatch)

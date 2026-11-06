@@ -619,7 +619,10 @@ def test_http_server_follows_application_lifecycle(
         url = _base_url(started[0])
         async with httpx.AsyncClient() as client:
             status = (await client.get(url)).status_code
-            await app.post_shutdown(app)
+        await app.post_shutdown(app)
+        # Cliente nuevo: sin una conexión keep-alive reutilizada, el puerto
+        # cerrado da siempre ConnectError (antes, a veces, ReadError).
+        async with httpx.AsyncClient() as client:
             try:
                 await client.get(url)
                 error = None
