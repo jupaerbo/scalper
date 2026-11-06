@@ -83,6 +83,12 @@ def no_real_page_fetches(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(scraper, "create_client", fake_create_client)
 
 
+@pytest.fixture(autouse=True)
+def no_backoff_waits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Los reintentos del buscador no esperan en los tests."""
+    monkeypatch.setattr(scraper, "BACKOFF_BASE", 0.0)
+
+
 def _search(
     max_price: float, results: list[dict[str, str]] = WEB_RESULTS, **kwargs: bool
 ) -> tuple[list[Product], list[str]]:
@@ -1177,3 +1183,278 @@ def test_product_page_with_breadcrumb_and_related_products_is_not_a_listing() ->
     )
 
     assert extract_price_from_html(html) == PagePrice(599.0, "EUR", None)
+
+
+# --- Rate-limit: reintentos, backoff y consultas flexibles ---------------------
+
+import logging  # noqa: E402
+
+from ddgs.exceptions import DDGSException, RatelimitException  # noqa: E402
+
+from scraper import (  # noqa: E402
+    BACKOFF_MAX,
+    EMPTY_SEARCH_ATTEMPTS,
+    SEARCH_ATTEMPTS,
+    SEARCH_BACKENDS,
+    backoff_delay,
+    is_rate_limit,
+    relaxed_queries,
+    run_search,
+)
+
+
+class _Scripted:
+    """search_fn que devuelve (o lanza) cada resultado de ``outcomes`` en orden."""
+
+    def __init__(self, *outcomes: object) -> None:
+        self.outcomes = list(outcomes)
+        self.queries: list[str] = []
+
+    def __call__(self, query: str) -> list[dict[str, str]]:
+        self.queries.append(query)
+        outcome = self.outcomes.pop(0) if self.outcomes else []
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome  # type: ignore[return-value]
+
+
+@pytest.fixture
+def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(scraper.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(scraper, "BACKOFF_BASE", 1.0)
+    return slept
+
+
+def test_backoff_delay_grows_exponentially_with_jitter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(scraper, "BACKOFF_BASE", 1.0)
+    for retry in range(6):
+        ceiling = min(BACKOFF_MAX, 2**retry)
+        delays = {backoff_delay(retry) for _ in range(20)}
+        assert all(ceiling / 2 <= d <= ceiling for d in delays)
+        assert len(delays) > 1  # jitter aleatorio
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (RatelimitException("x"), True),
+        (DDGSException("https://duckduckgo.com 202 Ratelimit"), True),
+        (RuntimeError("HTTP 429 Too Many Requests"), True),
+        (
+            httpx.HTTPStatusError(
+                "x",
+                request=httpx.Request("GET", "https://a.test"),
+                response=httpx.Response(429),
+            ),
+            True,
+        ),
+        (OSError("[Errno 11001] getaddrinfo failed"), False),
+        (DDGSException("No results found."), False),
+    ],
+)
+def test_is_rate_limit(error: Exception, expected: bool) -> None:
+    assert is_rate_limit(error) is expected
+
+
+def test_run_search_retries_network_errors_with_backoff(sleeps: list[float]) -> None:
+    fn = _Scripted(httpx.ConnectError("boom"), RatelimitException("x"), [_offer(1)])
+
+    results = asyncio.run(run_search("rtx", fn))
+
+    assert results == [_offer(1)]
+    assert len(fn.queries) == 3
+    assert 0.5 <= sleeps[0] <= 1.0 and 1.0 <= sleeps[1] <= 2.0
+
+
+def test_run_search_retries_empty_results_then_gives_up(sleeps: list[float]) -> None:
+    fn = _Scripted([], DDGSException("No results found."), [_offer(1)])
+
+    assert asyncio.run(run_search("rtx", fn)) == []
+    assert len(fn.queries) == EMPTY_SEARCH_ATTEMPTS
+    assert len(sleeps) == EMPTY_SEARCH_ATTEMPTS - 1
+
+
+def test_run_search_raises_last_error_and_logs_rate_limit(
+    sleeps: list[float], caplog: pytest.LogCaptureFixture
+) -> None:
+    fn = _Scripted(*[RatelimitException("202 Ratelimit")] * SEARCH_ATTEMPTS)
+
+    with (
+        caplog.at_level(logging.WARNING, logger="scraper"),
+        pytest.raises(RatelimitException),
+    ):
+        asyncio.run(run_search("rtx", fn))
+
+    assert len(fn.queries) == SEARCH_ATTEMPTS
+    assert len(sleeps) == SEARCH_ATTEMPTS - 1
+    assert "rate-limit" in caplog.text
+    assert "DDGS_PROXY" in caplog.text
+
+
+def test_run_search_rotates_ddgs_backends(monkeypatch: pytest.MonkeyPatch) -> None:
+    backends: list[str] = []
+
+    def fake_ddg(query: str, backend: str = "auto") -> list[dict[str, str]]:
+        backends.append(backend)
+        if len(backends) < 3:
+            raise RatelimitException("x")
+        return [_offer(1)]
+
+    monkeypatch.setattr(scraper, "_ddg_text", fake_ddg)
+
+    assert asyncio.run(run_search("rtx")) == [_offer(1)]
+    assert backends == list(SEARCH_BACKENDS)
+
+
+def test_rate_limit_on_first_query_is_a_clean_search_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fn = _Scripted(*[RatelimitException("x")] * SEARCH_ATTEMPTS)
+
+    with (
+        caplog.at_level(logging.WARNING, logger="scraper"),
+        pytest.raises(SearchError, match="limitado las peticiones"),
+    ):
+        asyncio.run(search_products("rtx", 1000.0, search_fn=fn))
+
+    assert "rate-limit" in caplog.text
+
+
+def test_rate_limit_in_later_query_keeps_results_and_stops() -> None:
+    fn = _Scripted([_offer(1)], *[RatelimitException("x")] * SEARCH_ATTEMPTS)
+
+    products = asyncio.run(search_products("rtx", 1000.0, search_fn=fn))
+
+    assert [p.store_name for p in products] == ["tienda1.es"]
+    # 1 consulta buena + los reintentos de la 2.ª; ni más consultas ni fallback.
+    assert len(fn.queries) == 1 + SEARCH_ATTEMPTS
+
+
+def test_first_query_recovers_after_transient_rate_limit() -> None:
+    fn = _Scripted(RatelimitException("x"), [_offer(i) for i in range(MIN_PRODUCTS)])
+
+    products = asyncio.run(search_products("rtx", 1000.0, search_fn=fn))
+
+    assert len(products) == MIN_PRODUCTS
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("rtx 4070", ["rtx 4070 precio", "rtx 4070"]),
+        (
+            "Comprar 'MSI RTX-4070 Ventus 2X' €",
+            ["msi rtx 4070 ventus 2x precio", "msi rtx 4070 ventus 2x", "msi rtx 4070"],
+        ),
+        ('"iphone 15" -funda oferta', ["iphone 15 funda precio", "iphone 15 funda"]),
+        ("comprar precio €", []),
+    ],
+)
+def test_relaxed_queries(name: str, expected: list[str]) -> None:
+    assert relaxed_queries(name) == expected
+
+
+def test_zero_results_falls_back_to_relaxed_queries() -> None:
+    queries: list[str] = []
+
+    def search_fn(query: str) -> list[dict[str, str]]:
+        queries.append(query)
+        return [_offer(1)] if query == "msi rtx 4070" else []
+
+    products = asyncio.run(
+        search_products("MSI RTX 4070 Ventus 2X", 1000.0, search_fn=search_fn)
+    )
+
+    assert [p.store_name for p in products] == ["tienda1.es"]
+    assert "msi rtx 4070 ventus 2x precio" in queries
+    assert queries[-1] == "msi rtx 4070"
+
+
+def test_no_fallback_when_main_queries_find_offers() -> None:
+    fn = _Scripted([_offer(1)], [_offer(2)])
+
+    asyncio.run(search_products("rtx", 1000.0, search_fn=fn))
+
+    assert fn.queries == build_queries("rtx")
+
+
+# --- Rotación de identidad en httpx ----------------------------------------------
+
+
+def _capture_headers(urls: list[tuple[str, str | None]]) -> list[httpx.Headers]:
+    sent: list[httpx.Headers] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.headers)
+        return httpx.Response(200)
+
+    async def run() -> None:
+        async with create_client(httpx.MockTransport(handler)) as client:
+            for url, referer in urls:
+                headers = {"Referer": referer} if referer else None
+                await client.get(url, headers=headers)
+
+    asyncio.run(run())
+    return sent
+
+
+def test_client_rotates_identity_per_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    agents = iter([CHROME_WIN, EDGE_MAC])
+    monkeypatch.setattr(scraper, "random_user_agent", lambda: next(agents))
+
+    a1, b, a2 = _capture_headers(
+        [
+            ("https://a.test/1", None),
+            ("https://b.test/1", None),
+            ("https://a.test/2", None),
+        ]
+    )
+
+    assert a1["User-Agent"] == a2["User-Agent"] == CHROME_WIN  # estable por sitio
+    assert b["User-Agent"] == EDGE_MAC
+    assert '"Microsoft Edge"' in b["Sec-Ch-Ua"]
+    assert b["Sec-Ch-Ua-Platform"] == '"macOS"'
+    assert a1["Accept-Language"] in scraper.ACCEPT_LANGUAGES
+    assert "python-httpx" not in a1["User-Agent"]
+
+
+def test_client_sends_realistic_sec_fetch_site() -> None:
+    direct, same, cross = _capture_headers(
+        [
+            ("https://a.test/1", None),
+            ("https://a.test/2", "https://a.test/1"),
+            ("https://b.test/1", "https://duckduckgo.com/"),
+        ]
+    )
+
+    assert direct["Sec-Fetch-Site"] == "none"
+    assert same["Sec-Fetch-Site"] == "same-origin"
+    assert cross["Sec-Fetch-Site"] == "cross-site"
+    assert direct["Sec-Fetch-Mode"] == "navigate"
+    assert direct["Accept"].startswith("text/html")
+
+
+def test_identity_is_kept_across_redirects() -> None:
+    sent: list[httpx.Headers] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.headers)
+        if request.url.path == "/old":
+            return httpx.Response(301, headers={"location": "https://a.test/new"})
+        return httpx.Response(200)
+
+    async def run() -> None:
+        async with create_client(httpx.MockTransport(handler)) as client:
+            await client.get("https://a.test/old")
+
+    asyncio.run(run())
+
+    assert len(sent) == 2
+    assert sent[0]["User-Agent"] == sent[1]["User-Agent"]

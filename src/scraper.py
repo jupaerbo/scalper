@@ -5,12 +5,13 @@ título, el precio, el dominio y el stock a partir del título y del fragmento.
 """
 
 import asyncio
+import functools
 import html as html_lib
 import json
 import logging
 import random
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import date
 from functools import cache
@@ -311,20 +312,116 @@ def _product_from_result(
     )
 
 
-def _ddg_text(query: str) -> list[dict[str, str]]:
+# --- Reintentos frente a rate-limit ---
+
+# Intentos por consulta si el buscador falla (red, rate-limit…) y si devuelve
+# 0 resultados (desde IPs de servidores suele ser un bloqueo encubierto).
+SEARCH_ATTEMPTS = 3
+EMPTY_SEARCH_ATTEMPTS = 2
+BACKOFF_BASE = 1.0  # segundos; se dobla en cada reintento
+BACKOFF_MAX = 8.0
+# Motores de ddgs por intento: si "auto" está bloqueado se prueban otros.
+SEARCH_BACKENDS = ("auto", "duckduckgo,brave,mojeek", "yahoo,startpage,mojeek")
+_RATE_LIMIT_MARKERS = ("ratelimit", "rate limit", "too many requests", "429")
+
+
+def _ddg_text(query: str, backend: str = "auto") -> list[dict[str, str]]:
     from ddgs import DDGS
 
-    return DDGS().text(query, region=WEB_REGION, max_results=WEB_MAX_RESULTS)
+    # DDGS lee el proxy de la variable de entorno DDGS_PROXY si está definida.
+    return DDGS().text(
+        query, region=WEB_REGION, max_results=WEB_MAX_RESULTS, backend=backend
+    )
+
+
+def backoff_delay(retry: int) -> float:
+    """Espera antes del reintento ``retry`` (0, 1, 2…): backoff exponencial
+    ``BACKOFF_BASE * 2**retry`` (máx. ``BACKOFF_MAX``) con jitter aleatorio
+    entre la mitad y el total, para no reintentar todos a la vez."""
+    ceiling = min(BACKOFF_MAX, BACKOFF_BASE * 2**retry)
+    return random.uniform(ceiling / 2, ceiling)
+
+
+def is_rate_limit(exc: BaseException) -> bool:
+    """``True`` si el error es un límite de peticiones del buscador."""
+    from ddgs.exceptions import RatelimitException
+
+    if isinstance(exc, RatelimitException):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code == 429
+    return any(m in str(exc).casefold() for m in _RATE_LIMIT_MARKERS)
+
+
+async def run_search(query: str, search_fn: SearchFn | None = None) -> list[dict]:
+    """Lanza ``query`` con reintentos y backoff exponencial.
+
+    Reintenta hasta ``SEARCH_ATTEMPTS`` veces si hay un error (red, timeout,
+    rate-limit) y hasta ``EMPTY_SEARCH_ATTEMPTS`` si no hay resultados. Con el
+    buscador por defecto cada intento usa otros motores (``SEARCH_BACKENDS``).
+
+    Returns:
+        Los resultados, o ``[]`` si tras los intentos no hay ninguno.
+
+    Raises:
+        Exception: El error del último intento, si el último intento falló.
+    """
+    for attempt in range(SEARCH_ATTEMPTS):
+        backend = SEARCH_BACKENDS[min(attempt, len(SEARCH_BACKENDS) - 1)]
+        fn = search_fn or functools.partial(_ddg_text, backend=backend)
+        error: Exception | None = None
+        try:
+            results = await asyncio.to_thread(fn, query)
+        except Exception as exc:
+            results = []
+            if not _is_no_results(exc):
+                error = exc
+        if results:
+            return results
+
+        last = attempt + 1 >= (SEARCH_ATTEMPTS if error else EMPTY_SEARCH_ATTEMPTS)
+        if last:
+            if error is None:
+                return []
+            if is_rate_limit(error):
+                logger.warning(
+                    "El buscador sigue limitando las peticiones (rate-limit) "
+                    "tras %d intentos para %r. Es habitual desde IPs de "
+                    "servidores compartidos (p. ej. Render); prueba a definir "
+                    "DDGS_PROXY o espera unos minutos.",
+                    attempt + 1,
+                    query,
+                )
+            raise error
+
+        delay = backoff_delay(attempt)
+        if error is None:
+            reason = "sin resultados"
+        elif is_rate_limit(error):
+            reason = "límite de peticiones (rate-limit)"
+        else:
+            reason = f"error {type(error).__name__}"
+        logger.log(
+            logging.INFO if error is None else logging.WARNING,
+            "Búsqueda %r: %s; reintento %d/%d en %.1f s",
+            query,
+            reason,
+            attempt + 1,
+            (SEARCH_ATTEMPTS if error else EMPTY_SEARCH_ATTEMPTS) - 1,
+            delay,
+        )
+        await asyncio.sleep(delay)
+    return []  # pragma: no cover - el bucle siempre retorna o lanza
 
 
 def describe_search_error(exc: Exception) -> str:
     """Mensaje claro para fallos del buscador (DNS, límite de peticiones…)."""
-    from ddgs.exceptions import RatelimitException, TimeoutException
+    from ddgs.exceptions import TimeoutException
 
+    if is_rate_limit(exc):
+        return "el buscador ha limitado las peticiones; espera unos minutos"
     if isinstance(exc, httpx.HTTPError):
         return describe_network_error(exc)
-    if isinstance(exc, RatelimitException):
-        return "el buscador ha limitado las peticiones; espera unos minutos"
     if isinstance(exc, TimeoutException):
         return "el buscador tardó demasiado en responder"
     reason = str(exc).lower()
@@ -374,10 +471,14 @@ async def search_products(
         repetidas: primero con stock, luego sin confirmar y por último
         agotadas; cada grupo por precio.
 
+    Cada consulta se reintenta con backoff exponencial (``run_search``). Si
+    las consultas de ``build_queries`` no dan ningún resultado útil, se
+    prueban las de ``relaxed_queries``.
+
     Raises:
         ValueError: Si ``name`` está vacío o ``max_price`` es negativo.
-        SearchError: Si la primera consulta falla (red, DNS, límite…). Si falla
-            una consulta posterior se devuelve lo reunido hasta entonces.
+        SearchError: Si la primera consulta falla tras sus reintentos (red,
+            DNS, rate-limit…). Si falla una posterior se devuelve lo reunido.
     """
     name = name.strip()
     if not name:
@@ -399,20 +500,7 @@ async def search_products(
             offers[product.url] = product
         return True
 
-    for attempt, query in enumerate(build_queries(name)):
-        try:
-            results = await asyncio.to_thread(search_fn or _ddg_text, query)
-        except Exception as exc:
-            if _is_no_results(exc):
-                # ddgs lanza una excepción cuando no hay resultados: no es un
-                # fallo de red, simplemente se prueba la siguiente consulta.
-                logger.info("Sin resultados para %r", query)
-                continue
-            logger.warning("Búsqueda web fallida para %r: %r", query, exc)
-            if attempt == 0:
-                raise SearchError(describe_search_error(exc)) from exc
-            break
-
+    def ingest(results: list[dict]) -> None:
         for result in results:
             product = parse_web_result(result)
             if product is None:
@@ -423,8 +511,36 @@ async def search_products(
                 and product.price <= max_price * RECHECK_PRICE_MARGIN
             ):
                 over_budget.setdefault(product.url, result)
-        if len(offers) >= MIN_PRODUCTS:
-            break
+
+    async def run_queries(queries: list[str], *, strict: bool) -> bool:
+        """Lanza las consultas en orden; ``False`` si hubo que abortar."""
+        for index, query in enumerate(queries):
+            try:
+                ingest(await run_search(query, search_fn))
+            except Exception as exc:
+                logger.warning(
+                    "Búsqueda web fallida para %r: %s (%r)",
+                    query,
+                    describe_search_error(exc),
+                    exc,
+                )
+                if strict and index == 0:
+                    raise SearchError(describe_search_error(exc)) from exc
+                # Tras un rate-limit, insistir solo empeora el bloqueo.
+                return False
+            if len(offers) >= MIN_PRODUCTS:
+                break
+        return True
+
+    queries = build_queries(name)
+    healthy = await run_queries(queries, strict=True)
+    if healthy and not (offers or priceless or over_budget):
+        # 0 resultados útiles: se relaja la consulta (sin términos de compra,
+        # símbolos ni detalles) para encontrar al menos algunas ofertas.
+        fallback = [q for q in relaxed_queries(name) if q not in queries]
+        if fallback:
+            logger.info("Sin resultados; probando consultas flexibles: %s", fallback)
+            await run_queries(fallback, strict=False)
 
     pending = [
         result for url, result in (priceless | over_budget).items() if url not in offers
@@ -864,11 +980,52 @@ def build_queries(name: str) -> list[str]:
     return list(dict.fromkeys(queries))
 
 
+RELAXED_MAX_TOKENS = 3
+
+
+def relaxed_queries(name: str) -> list[str]:
+    """Consultas más flexibles para cuando ``build_queries`` no da resultados.
+
+    Quita términos de compra (``PURCHASE_TERMS``), comillas, operadores y
+    símbolos, y prueba: el núcleo con "precio", el núcleo solo y, si es
+    largo, sus ``RELAXED_MAX_TOKENS`` primeras palabras.
+    ``"Comprar 'MSI RTX-4070 Ventus 2X' €"`` → ``["msi rtx 4070 ventus 2x
+    precio", "msi rtx 4070 ventus 2x", "msi rtx 4070"]``.
+    """
+    tokens = [
+        t
+        for t in re.findall(r"[^\W_]+(?:[.,+][^\W_]+)*", name.casefold())
+        if t not in PURCHASE_TERMS
+    ]
+    if not tokens:
+        return []
+    core = " ".join(tokens)
+    queries = [f"{core} precio", core]
+    if len(tokens) > RELAXED_MAX_TOKENS:
+        queries.append(" ".join(tokens[:RELAXED_MAX_TOKENS]))
+    return list(dict.fromkeys(queries))
+
+
 # --- Utilidades HTTP (para descargar páginas concretas) ---------------------
 
 REQUEST_DELAY: tuple[float, float] = (1.5, 3.5)
 REQUEST_TIMEOUT = 10.0
 ACCEPT_LANGUAGE = "es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7"
+# Variantes reales de Accept-Language de un navegador en español.
+ACCEPT_LANGUAGES = (
+    ACCEPT_LANGUAGE,
+    "es-ES,es;q=0.9",
+    "es-ES,es;q=0.9,en;q=0.8",
+    "es-ES,es;q=0.8,en-US;q=0.5,en;q=0.3",
+)
+# Cabeceras que forman la "identidad" de navegador que se rota.
+IDENTITY_HEADERS = (
+    "User-Agent",
+    "Accept-Language",
+    "Sec-Ch-Ua",
+    "Sec-Ch-Ua-Mobile",
+    "Sec-Ch-Ua-Platform",
+)
 ACCEPT_HTML = (
     "text/html,application/xhtml+xml,application/xml;q=0.9,"
     "image/avif,image/webp,*/*;q=0.8"
@@ -957,16 +1114,60 @@ def browser_headers(user_agent: str) -> dict[str, str]:
     return headers
 
 
+def _fetch_site(request: httpx.Request) -> str:
+    """``Sec-Fetch-Site`` coherente con el ``Referer`` de la petición."""
+    referer = request.headers.get("Referer")
+    if not referer:
+        return "none"  # navegación directa (como escribir la URL)
+    return (
+        "same-origin"
+        if urlsplit(referer).hostname == request.url.host
+        else ("cross-site")
+    )
+
+
+def _identity_rotator() -> Callable[[httpx.Request], Awaitable[None]]:
+    """Hook de petición que asigna a cada host su propia identidad aleatoria.
+
+    Cada sitio ve un navegador distinto (User-Agent, ``Sec-Ch-Ua*`` y
+    ``Accept-Language`` coherentes entre sí), pero estable dentro del mismo
+    sitio, también entre redirecciones: cambiarlo a mitad de visita delata
+    a un bot.
+    """
+    identities: dict[str, dict[str, str]] = {}
+
+    async def rotate(request: httpx.Request) -> None:
+        host = request.url.host
+        identity = identities.get(host)
+        if identity is None:
+            headers = browser_headers(random_user_agent())
+            headers["Accept-Language"] = random.choice(ACCEPT_LANGUAGES)
+            identity = {k: v for k, v in headers.items() if k in IDENTITY_HEADERS}
+            identities[host] = identity
+        for name in IDENTITY_HEADERS:
+            request.headers.pop(name, None)
+        request.headers.update(identity)
+        request.headers["Sec-Fetch-Site"] = _fetch_site(request)
+
+    return rotate
+
+
 def create_client(
     transport: httpx.AsyncBaseTransport | None = None,
     timeout: float = REQUEST_TIMEOUT,
 ) -> httpx.AsyncClient:
-    """Cliente HTTP con cabeceras de navegador y un User-Agent aleatorio fijo."""
+    """Cliente HTTP con cabeceras de navegador realistas.
+
+    Rota la identidad (User-Agent y cabeceras asociadas) por cada sitio
+    visitado; ver ``_identity_rotator``.
+    """
+    base = {k: v for k, v in browser_headers("").items() if k not in IDENTITY_HEADERS}
     return httpx.AsyncClient(
-        headers=browser_headers(random_user_agent()),
+        headers=base,
         timeout=timeout,
         follow_redirects=True,
         transport=transport,
+        event_hooks={"request": [_identity_rotator()]},
     )
 
 
