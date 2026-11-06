@@ -1479,6 +1479,7 @@ from scraper import (  # noqa: E402
 )
 
 API_KEY = "test-api-key-123"
+EX = scraper.SITE_EXCLUSIONS  # exclusiones -site: de toda consulta a la API
 
 SERPER_RESPONSE = {
     "organic": [
@@ -1728,7 +1729,7 @@ def test_api_is_the_primary_engine_when_key_is_set(
     # 649 € va primero por estar "En stock"; 599,90 € tiene stock sin confirmar.
     assert [p.price for p in products] == [649.0, 599.9]
     assert len(requests) == 1  # una sola llamada: no gasta cuota de más
-    assert json_query(requests[0]) == "rtx 4070 1..1000 €"
+    assert json_query(requests[0]) == f"rtx 4070 1..1000 € {EX}"
     assert fn.queries == []
 
 
@@ -1900,28 +1901,28 @@ from scraper import build_api_query, filter_by_max_price  # noqa: E402
 @pytest.mark.parametrize(
     ("name", "max_price", "expected"),
     [
-        ("rtx 4070", 700.0, "rtx 4070 1..700 €"),
-        ("RTX 4070", 649.99, "RTX 4070 1..650 €"),
-        ('comprar "iPhone 15" precio €', 900.0, "iPhone 15 1..900 €"),
-        ("cable", 0.5, "cable 1..1 €"),
+        ("rtx 4070", 700.0, f"rtx 4070 1..700 € {EX}"),
+        ("RTX 4070", 649.99, f"RTX 4070 1..650 € {EX}"),
+        ('comprar "iPhone 15" precio €', 900.0, f"iPhone 15 1..900 € {EX}"),
+        ("cable", 0.5, f"cable 1..1 € {EX}"),
         # Comillas tipográficas, paréntesis, operadores y símbolos fuera.
         (
             "“MSI” RTX-4070 (Ventus 2X) -funda *oferta* 12GB!",
             700.0,
-            "MSI RTX-4070 Ventus 2X funda 12GB 1..700 €",
+            f"MSI RTX-4070 Ventus 2X funda 12GB 1..700 € {EX}",
         ),
         (
             'SSD 2.5" 1TB <Samsung> & más',
             90.0,
-            "SSD 2.5 1TB Samsung más 1..90 €",
+            f"SSD 2.5 1TB Samsung más 1..90 € {EX}",
         ),
         (
             "usb-c 3.1 cable: 2m; ¿barato?",
             15.0,
-            "usb-c 3.1 cable 2m 1..15 €",
+            f"usb-c 3.1 cable 2m 1..15 € {EX}",
         ),
-        ("Core i7+ 13700K", 400.0, "Core i7+ 13700K 1..400 €"),
-        ("comprar precio €", 100.0, "comprar precio 1..100 €"),
+        ("Core i7+ 13700K", 400.0, f"Core i7+ 13700K 1..400 € {EX}"),
+        ("comprar precio €", 100.0, f"comprar precio 1..100 € {EX}"),
     ],
 )
 def test_build_api_query_uses_clean_price_range(
@@ -1941,9 +1942,9 @@ def test_build_api_query_uses_clean_price_range(
 def test_build_api_query_has_no_quotes_or_special_characters(name: str) -> None:
     query = build_api_query(name, 700.0)
 
-    assert re.fullmatch(r"[\w .,+\-/€]+", query), query
+    assert re.fullmatch(r"[\w .,+\-/€]+", query.removesuffix(f" {EX}")), query
     assert "€.." not in query and "..€" not in query  # rango sin moneda dentro
-    assert query.endswith(" 1..700 €")
+    assert query.endswith(f" 1..700 € {EX}")
 
 
 def test_serper_payload_targets_spain_with_price_range_query(
@@ -1964,7 +1965,7 @@ def test_serper_payload_targets_spain_with_price_range_query(
     payload = json.loads(requests[0].content)
     assert payload["gl"] == "es"
     assert payload["hl"] == "es"
-    assert payload["q"] == "rtx 4070 1..700 €"
+    assert payload["q"] == f"rtx 4070 1..700 € {EX}"
     assert requests[0].method == "POST"
 
 
@@ -2042,7 +2043,7 @@ def test_clean_api_product(name: str, expected: str) -> None:
 
 def test_api_query_has_no_purchase_terms() -> None:
     assert build_api_query("comprar rtx 4070 oferta tienda barato", 700.0) == (
-        "rtx 4070 1..700 €"
+        f"rtx 4070 1..700 € {EX}"
     )
 
 
@@ -2076,7 +2077,7 @@ def _run_fallback(*responses: httpx.Response, max_price: float = 700.0) -> tuple
 def test_range_query_with_results_needs_a_single_call() -> None:
     results, queries = _run_fallback(httpx.Response(200, json=SERPER_RESPONSE))
 
-    assert queries == ["RTX-4070 super 1..700 €"]
+    assert queries == [f"RTX-4070 super 1..700 € {EX}"]
     assert [r["href"] for r in results] == [
         "https://pctienda.es/msi-rtx-4070",
         "https://otra.es/eagle",
@@ -2094,7 +2095,7 @@ def test_range_query_with_results_needs_a_single_call() -> None:
 def test_400_or_zero_results_retries_with_product_only(first: httpx.Response) -> None:
     results, queries = _run_fallback(first, httpx.Response(200, json=SERPER_RESPONSE))
 
-    assert queries == ["RTX-4070 super 1..700 €", "RTX-4070 super"]
+    assert queries == [f"RTX-4070 super 1..700 € {EX}", f"RTX-4070 super {EX}"]
     assert len(results) == 2
 
 
@@ -2110,7 +2111,7 @@ def test_other_api_errors_do_not_retry_without_range(status: int) -> None:
 
     with pytest.raises(httpx.HTTPStatusError):
         asyncio.run(run())
-    assert queries == ["rtx 4070 1..700 €"]
+    assert queries == [f"rtx 4070 1..700 € {EX}"]
 
 
 def test_retry_failure_propagates_and_search_falls_back_to_ddgs(
@@ -2127,7 +2128,7 @@ def test_retry_failure_propagates_and_search_falls_back_to_ddgs(
 
     products = asyncio.run(run())
 
-    assert queries == ["rtx 4070 1..1000 €", "rtx 4070"]
+    assert queries == [f"rtx 4070 1..1000 € {EX}", f"rtx 4070 {EX}"]
     assert [p.store_name for p in products] == ["tienda1.es"]
 
 
@@ -2192,5 +2193,235 @@ def test_retry_payload_keeps_spanish_localisation() -> None:
     import json
 
     payloads = [json.loads(r.content) for r in sent]
-    assert [p["q"] for p in payloads] == ["rtx 4070 1..700 €", "rtx 4070"]
+    assert [p["q"] for p in payloads] == [f"rtx 4070 1..700 € {EX}", f"rtx 4070 {EX}"]
     assert all(p["gl"] == "es" and p["hl"] == "es" for p in payloads)
+
+
+# --- Solo tiendas: lista negra de dominios ------------------------------------
+
+from scraper import (  # noqa: E402
+    BLOCKED_DOMAINS,
+    EXCLUDED_SITES,
+    build_api_fallback_query,
+    filter_store_results,
+    is_valid_store_url,
+)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.pccomponentes.com/msi-geforce-rtx-4070-ventus-2x",
+        "https://www.amazon.es/dp/B0BZ8Z1234",
+        "https://www.coolmod.com/msi-rtx-4070/",
+        "https://www.mediamarkt.es/es/product/_rtx-4070.html",
+        "http://tienda.example.es/p?id=1",
+        "https://www.box.com/p",  # termina en "x.com" pero no es x.com
+        "https://youtubers-shop.es/p",  # contiene "youtube" sin ser youtube.com
+        "https://WWW.Coolmod.COM./p",  # mayúsculas y punto final
+    ],
+)
+def test_is_valid_store_url_accepts_shops(url: str) -> None:
+    assert is_valid_store_url(url) is True
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.youtube.com/watch?v=xxx",
+        "https://m.youtube.com/watch?v=xxx",
+        "https://youtu.be/xxx",
+        "https://www.reddit.com/r/nvidia/comments/abc/rtx_4070/",
+        "https://old.reddit.com/r/buildapc",
+        "https://es.wikipedia.org/wiki/GeForce_40",
+        "https://www.tiktok.com/@user/video/1",
+        "https://www.instagram.com/p/xyz",
+        "https://m.facebook.com/marketplace/item/1",
+        "https://twitter.com/user/status/1",
+        "https://x.com/user/status/1",
+        "https://www.pinterest.com/pin/1",
+        "https://vimeo.com/123",
+        "https://www.twitch.tv/canal",
+        "https://es.wikihow.com/elegir-una-tarjeta-grafica",
+        "https://medium.com/@autor/rtx-4070-review",
+        "https://autor.medium.com/rtx-4070",
+        # URLs no utilizables
+        "ftp://amazon.es/p",
+        "amazon.es/p",
+        "",
+        "https://[::1/p",
+    ],
+)
+def test_is_valid_store_url_rejects_non_shops(url: str) -> None:
+    assert is_valid_store_url(url) is False
+
+
+def test_blocked_domains_cover_the_requested_platforms() -> None:
+    assert {
+        "youtube.com", "youtu.be", "tiktok.com", "instagram.com", "facebook.com",
+        "twitter.com", "x.com", "pinterest.com", "vimeo.com", "twitch.tv",
+        "reddit.com", "wikipedia.org", "wikihow.com", "medium.com",
+    } <= BLOCKED_DOMAINS  # fmt: skip
+
+
+EXPECTED_EXCLUSIONS = (
+    "-site:youtube.com -site:youtu.be -site:tiktok.com -site:instagram.com "
+    "-site:facebook.com -site:twitter.com -site:x.com -site:pinterest.com "
+    "-site:reddit.com -site:vimeo.com -site:twitch.tv -site:wikipedia.org "
+    "-site:wikihow.com -site:medium.com"
+)
+
+
+def test_api_queries_exclude_social_and_video_sites() -> None:
+    assert EX == EXPECTED_EXCLUSIONS
+    assert build_api_query("rtx 4070", 700.0) == (
+        f"rtx 4070 1..700 € {EXPECTED_EXCLUSIONS}"
+    )
+    assert build_api_fallback_query("rtx 4070") == f"rtx 4070 {EXPECTED_EXCLUSIONS}"
+    assert len(EXCLUDED_SITES) == 14
+
+
+def test_every_blocked_domain_is_also_excluded_in_the_api_query() -> None:
+    """Lo que se descarta en Python ni se pide a Serper (no gasta resultados)."""
+    assert set(EXCLUDED_SITES) == BLOCKED_DOMAINS
+    assert len(EXCLUDED_SITES) == len(set(EXCLUDED_SITES))  # sin duplicados
+
+
+def test_both_api_calls_send_the_site_exclusions() -> None:
+    """Tanto la búsqueda con rango como el reintento sin rango llevan -site:."""
+    _, queries = _run_fallback(
+        httpx.Response(400), httpx.Response(200, json=SERPER_RESPONSE)
+    )
+
+    assert len(queries) == 2
+    assert all(q.endswith(EXPECTED_EXCLUSIONS) for q in queries)
+    assert "1..700 €" in queries[0] and "1..700" not in queries[1]
+
+
+def test_filter_store_results_keeps_order_and_drops_blocked() -> None:
+    results = [
+        {"title": "A", "href": "https://www.youtube.com/watch?v=1"},
+        {"title": "B", "href": "https://www.pccomponentes.com/p"},
+        {"title": "C", "url": "https://es.wikipedia.org/wiki/X"},
+        {"title": "D", "url": "https://www.amazon.es/dp/1"},
+        {"title": "E", "href": "no-es-una-url"},
+    ]
+
+    kept = filter_store_results(results)
+
+    assert [r["title"] for r in kept] == ["B", "D"]
+
+
+SOCIAL_ONLY = {
+    "organic": [
+        {"title": "RTX 4070 review 599 €", "link": "https://www.youtube.com/watch?v=1"},
+        {"title": "RTX 4070 vale la pena", "link": "https://www.reddit.com/r/x/1"},
+    ]
+}
+
+
+def test_api_non_store_results_are_dropped_before_price_filter() -> None:
+    mixed = {"organic": SOCIAL_ONLY["organic"] + SERPER_RESPONSE["organic"]}
+
+    results, queries = _run_fallback(httpx.Response(200, json=mixed))
+
+    assert len(queries) == 1
+    assert [r["href"] for r in results] == [
+        "https://pctienda.es/msi-rtx-4070",
+        "https://otra.es/eagle",
+    ]
+
+
+def test_only_non_store_api_results_trigger_retry_without_range() -> None:
+    results, queries = _run_fallback(
+        httpx.Response(200, json=SOCIAL_ONLY),
+        httpx.Response(200, json=SERPER_RESPONSE),
+    )
+
+    assert len(queries) == 2
+    assert len(results) == 2
+
+
+def test_api_with_only_non_store_results_falls_back_to_ddgs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_api(monkeypatch)
+    client, queries = _scripted_api(
+        httpx.Response(200, json=SOCIAL_ONLY), httpx.Response(200, json=SOCIAL_ONLY)
+    )
+
+    async def run() -> list[Product]:
+        async with client:
+            return await search_products(
+                "rtx 4070", 1000.0, search_fn=_Scripted([_offer(1)]), api_client=client
+            )
+
+    products = asyncio.run(run())
+
+    assert len(queries) == 2
+    assert [p.store_name for p in products] == ["tienda1.es"]
+
+
+def test_api_empty_after_domain_and_price_filters_returns_empty_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sin nada útil en la API ni en ddgs: lista vacía, sin excepciones."""
+    _enable_api(monkeypatch)
+    expensive = {
+        "organic": [
+            {"title": "RTX 4070 - 900 €", "link": "https://tienda.es/p"},
+            {"title": "RTX 4070 - 99 €", "link": "https://www.youtube.com/watch"},
+        ]
+    }
+    client, _ = _scripted_api(
+        httpx.Response(200, json=expensive), httpx.Response(200, json=expensive)
+    )
+
+    async def run() -> list[Product]:
+        async with client:
+            return await search_products(
+                "rtx 4070", 500.0, search_fn=_Scripted(), api_client=client
+            )
+
+    assert asyncio.run(run()) == []
+
+
+def test_ddgs_results_from_blocked_domains_are_discarded() -> None:
+    results = [
+        {
+            "title": "RTX 4070 unboxing 549 €",
+            "href": "https://www.youtube.com/watch?v=abc",
+            "body": "Vídeo",
+        },
+        {
+            "title": "Opiniones RTX 4070 - 499 €",
+            "href": "https://www.reddit.com/r/nvidia/comments/1",
+            "body": "",
+        },
+        {
+            "title": "RTX 4070 sin precio",
+            "href": "https://es.wikipedia.org/wiki/RTX_4070",
+            "body": "",
+        },
+        _offer(1),
+    ]
+    fetched: list[str] = []
+
+    def pages(request: httpx.Request) -> httpx.Response:
+        fetched.append(str(request.url))
+        return httpx.Response(404)
+
+    async def run() -> list[Product]:
+        transport = httpx.MockTransport(pages)
+        async with httpx.AsyncClient(transport=transport) as page_client:
+            return await search_products(
+                "rtx 4070",
+                1000.0,
+                search_fn=lambda _: results,
+                page_client=page_client,
+            )
+
+    products = asyncio.run(run())
+
+    assert [p.store_name for p in products] == ["tienda1.es"]
+    assert not any("wikipedia" in url for url in fetched)  # ni se inspecciona

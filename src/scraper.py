@@ -17,7 +17,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import date
 from functools import cache
-from urllib.parse import urlsplit
+from urllib.parse import urlparse, urlsplit
 
 import httpx
 from fake_useragent import UserAgent
@@ -768,7 +768,7 @@ async def search_products(
         hubo que abortar (tras un rate-limit, insistir empeora el bloqueo)."""
         for index, query in enumerate(queries):
             try:
-                ingest(await run_search(query, search_fn))
+                ingest(filter_store_results(await run_search(query, search_fn)))
             except Exception as exc:
                 logger.warning(
                     "Búsqueda web fallida para %r: %s (%r)",
@@ -1262,13 +1262,20 @@ def clean_api_product(name: str) -> str:
 
 
 def build_api_query(name: str, max_price: float) -> str:
-    """Consulta con rango de precio: estrictamente ``{producto} 1..{max} €``.
+    """Consulta con rango de precio: ``{producto} 1..{max} € -site:…``.
 
-    ``rtx 4070``, 649,99 → ``rtx 4070 1..650 €`` (el máximo se redondea hacia
-    arriba y el operador ``..`` va sin símbolos de moneda dentro).
+    ``rtx 4070``, 649,99 → ``rtx 4070 1..650 € -site:youtube.com …`` (el
+    máximo se redondea hacia arriba, el operador ``..`` va sin símbolos de
+    moneda dentro y al final se excluyen redes sociales y vídeo,
+    ``SITE_EXCLUSIONS``).
     """
     top = max(1, math.ceil(max_price))
-    return f"{clean_api_product(name)} 1..{top} €"
+    return f"{clean_api_product(name)} 1..{top} € {SITE_EXCLUSIONS}"
+
+
+def build_api_fallback_query(name: str) -> str:
+    """Consulta sin rango para el reintento: ``{producto} -site:…``."""
+    return f"{clean_api_product(name)} {SITE_EXCLUSIONS}"
 
 
 async def search_api_with_fallback(
@@ -1280,20 +1287,23 @@ async def search_api_with_fallback(
 ) -> list[dict[str, str]]:
     """Busca en la API con rango de precio y, si hace falta, sin él.
 
-    1. ``build_api_query`` (``{producto} 1..{max} €``).
-    2. Si responde HTTP 400 o 0 resultados, reintenta con solo
-       ``clean_api_product`` (el operador de rango no siempre se admite).
+    1. ``build_api_query`` (``{producto} 1..{max} € -site:…``).
+    2. Si responde HTTP 400 o ningún resultado de tienda, reintenta con
+       ``build_api_fallback_query`` (``{producto} -site:…``), ya que el
+       operador de rango no siempre se admite.
 
-    A cada respuesta se le aplica ``filter_by_max_price``.
+    A cada respuesta se le aplican ``filter_store_results`` (fuera redes
+    sociales, vídeo, foros…) y ``filter_by_max_price``.
 
     Returns:
-        Resultados que no superan ``max_price`` (los sin precio se conservan).
+        Resultados de tiendas que no superan ``max_price`` (los sin precio se
+        conservan); puede ser una lista vacía.
 
     Raises:
         httpx.HTTPError, ValueError: Si la API falla (401, 429, red…), o si el
             reintento sin rango también falla.
     """
-    queries = (build_api_query(name, max_price), clean_api_product(name))
+    queries = (build_api_query(name, max_price), build_api_fallback_query(name))
     for attempt, query in enumerate(queries):
         last = attempt == len(queries) - 1
         try:
@@ -1305,12 +1315,86 @@ async def search_api_with_fallback(
                 "API (%s): HTTP 400 con rango; reintento sin rango", config.provider
             )
             continue
-        if results or last:
-            return filter_by_max_price(results, max_price)
+        stores = filter_store_results(results)
+        if stores or last:
+            return filter_by_max_price(stores, max_price)
         logger.info(
-            "API (%s): 0 resultados con rango; reintento sin rango", config.provider
+            "API (%s): 0 resultados de tiendas con rango; reintento sin rango",
+            config.provider,
         )
     return []  # pragma: no cover - el bucle siempre retorna o lanza
+
+
+# --- Solo tiendas: fuera redes sociales, vídeo y foros -----------------------
+
+# Excluidos en la propia consulta a la API (operador -site: de Google).
+EXCLUDED_SITES = (
+    "youtube.com",
+    "youtu.be",
+    "tiktok.com",
+    "instagram.com",
+    "facebook.com",
+    "twitter.com",
+    "x.com",
+    "pinterest.com",
+    "reddit.com",
+    "vimeo.com",
+    "twitch.tv",
+    "wikipedia.org",
+    "wikihow.com",
+    "medium.com",
+)
+SITE_EXCLUSIONS = " ".join(f"-site:{site}" for site in EXCLUDED_SITES)
+
+# Descartados en Python, vengan de la API o de ddgs (subdominios incluidos).
+BLOCKED_DOMAINS = frozenset(
+    {
+        # Vídeo y redes sociales
+        "youtube.com",
+        "youtu.be",
+        "tiktok.com",
+        "instagram.com",
+        "facebook.com",
+        "twitter.com",
+        "x.com",
+        "pinterest.com",
+        "vimeo.com",
+        "twitch.tv",
+        # Foros, wikis y blogs sin venta directa
+        "reddit.com",
+        "wikipedia.org",
+        "wikihow.com",
+        "medium.com",
+    }
+)
+
+
+def is_valid_store_url(url: str) -> bool:
+    """``True`` si ``url`` puede ser una tienda: http(s) y fuera de
+    ``BLOCKED_DOMAINS``.
+
+    Compara el dominio completo y sus subdominios: ``m.youtube.com`` o
+    ``es.wikipedia.org`` se descartan, pero ``box.com`` no cuenta como
+    ``x.com``.
+    """
+    try:
+        parts = urlparse(url)
+        host = (parts.hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https") or not host:
+        return False
+    return not any(
+        host == domain or host.endswith(f".{domain}") for domain in BLOCKED_DOMAINS
+    )
+
+
+def filter_store_results(results: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Deja solo los resultados cuya URL supera ``is_valid_store_url``."""
+    kept = [r for r in results if is_valid_store_url(_result_url(r) or "")]
+    if dropped := len(results) - len(kept):
+        logger.info("Descartados %d resultado(s) que no son tiendas", dropped)
+    return kept
 
 
 def filter_by_max_price(
