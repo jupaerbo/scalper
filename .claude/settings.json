@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./.venv/**)",
+      "Read(./venv/**)",
+      "Read(./virtualenv/**)",
+      "Read(./**/__pycache__/**)",
+      "Read(./**/*.pyc)",
+      "Read(./.pytest_cache/**)",
+      "Read(./.ruff_cache/**)",
+      "Read(./.mypy_cache/**)",
+      "Read(./build/**)",
+      "Read(./dist/**)",
+      "Read(./logs/**)",
+      "Read(./**/*.log)",
+      "Read(./**/*.csv)",
+      "Read(./**/*.sqlite3)",
+      "Read(./**/*.db)",
+    ]
+  }
+}

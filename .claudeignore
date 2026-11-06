@@ -1,0 +1,35 @@
+# Entornos virtuales
+.venv/
+venv/
+env/
+ENV/
+.env/
+virtualenv/
+
+# Caché y compilados de Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+
+# Logs
+logs/
+*.log
+
+# Archivos de datos
+*.csv
+*.json
+*.sqlite3
+*.db
+*.parquet
+*.xlsx
+*.pkl
+data/
+
+# Secretos
+.env
+

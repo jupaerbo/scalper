@@ -1,0 +1,35 @@
+[project]
+name = "phyton"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "ddgs>=9.16.1",
+    "fake-useragent>=2.2.0",
+    "httpx>=0.28.1",
+    "python-dotenv>=1.2.4",
+    "python-telegram-bot[job-queue]>=22.8",
+    "rich>=15.0.0",
+    "typer>=0.28.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+extend-exclude = [".venv", "logs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

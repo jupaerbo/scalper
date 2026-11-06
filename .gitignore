@@ -1,0 +1,23 @@
+# Secretos
+.env
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Caché y compilados de Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+
+# Logs y resultados exportados
+logs/
+*.log
+resultados*.json
+resultados*.csv
