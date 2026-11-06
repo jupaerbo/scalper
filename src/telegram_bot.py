@@ -10,6 +10,7 @@ defecto), en el mismo bucle de eventos que el bot.
 
 import logging
 import os
+import secrets
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -47,13 +48,17 @@ ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 WAITING_NAME, WAITING_PRICE, ASK_ALERT = range(3)
 
 ALERT_INTERVAL_SECONDS = 30 * 60
-# Una búsqueda a medias caduca: el siguiente texto vuelve a ser un producto.
-CONVERSATION_TIMEOUT_SECONDS = 15 * 60
 MAX_ALERTS_PER_CHAT = 5
 MAX_NAME_LENGTH = 100
+# Prefijos del callback_data de los botones; se completan con ":<token>" de la
+# búsqueda (``alert:yes:3fa9c2d1``) para que cada botón sepa a qué búsqueda
+# pertenece aunque el usuario haya empezado otra después.
 CALLBACK_ALERT_YES = "alert:yes"
 CALLBACK_ALERT_NO = "alert:no"
 ALERT_JOB_PREFIX = "alert"
+# Búsquedas con botones pendientes de pulsar que se recuerdan por chat.
+PENDING_SEARCHES_KEY = "pending_searches"
+MAX_PENDING_SEARCHES = 10
 
 Snapshot = dict[str, Product]
 
@@ -252,7 +257,10 @@ async def receive_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             "Inténtalo de nuevo escribiendo el producto o con /buscar.",
         )
 
-    context.user_data["snapshot"] = take_snapshot(products)
+    token = _remember_search(
+        context, AlertData(name, max_price, take_snapshot(products))
+    )
+    context.user_data["token"] = token
     await update.effective_message.reply_text(
         format_results(products, max_price),
         parse_mode=ParseMode.HTML,
@@ -262,9 +270,11 @@ async def receive_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         [
             [
                 InlineKeyboardButton(
-                    "🔔 Crear Alerta", callback_data=CALLBACK_ALERT_YES
+                    "🔔 Crear Alerta", callback_data=f"{CALLBACK_ALERT_YES}:{token}"
                 ),
-                InlineKeyboardButton("❌ Cancelar", callback_data=CALLBACK_ALERT_NO),
+                InlineKeyboardButton(
+                    "❌ Cancelar", callback_data=f"{CALLBACK_ALERT_NO}:{token}"
+                ),
             ]
         ]
     )
@@ -274,22 +284,67 @@ async def receive_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         "si cambia el stock o el precio?",
         reply_markup=keyboard,
     )
+    # Se queda en ASK_ALERT, sin tiempo límite, hasta que se pulse un botón.
     return ASK_ALERT
 
 
+def _remember_search(context: ContextTypes.DEFAULT_TYPE, data: AlertData) -> str:
+    """Guarda la búsqueda hasta que se pulse uno de sus botones.
+
+    Se guarda en ``chat_data`` (no en ``user_data``, que se borra al empezar
+    otra búsqueda) para que los botones de búsquedas anteriores sigan
+    funcionando. Se recuerdan las ``MAX_PENDING_SEARCHES`` más recientes.
+
+    Returns:
+        El token que identifica la búsqueda en el ``callback_data``.
+    """
+    pending: dict[str, AlertData] = context.chat_data.setdefault(
+        PENDING_SEARCHES_KEY, {}
+    )
+    token = secrets.token_hex(4)
+    pending[token] = data
+    while len(pending) > MAX_PENDING_SEARCHES:
+        pending.pop(next(iter(pending)))  # la más antigua
+    return token
+
+
 async def alert_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Crea (o no) la alerta periódica según el botón pulsado."""
+    """Botones "🔔 Crear Alerta" / "❌ Cancelar" de una búsqueda.
+
+    Siempre responde con ``query.answer()`` primero, para quitar el icono de
+    carga en Telegram. Funciona tanto dentro de la conversación (``ASK_ALERT``)
+    como fuera de ella, con botones de búsquedas anteriores.
+
+    Returns:
+        ``END`` si el botón es de la búsqueda en curso; si es de una anterior,
+        ``ASK_ALERT`` para seguir esperando los botones de la actual.
+    """
     query = update.callback_query
     await query.answer()
 
-    if query.data != CALLBACK_ALERT_YES:
-        await query.edit_message_text("De acuerdo, no crearé ninguna alerta. 👍")
+    action, _, token = (query.data or "").removeprefix("alert:").partition(":")
+    current = context.user_data.get("token")
+    is_current = bool(token) and token == current
+    next_state = ConversationHandler.END if is_current or not current else ASK_ALERT
+    if is_current:
         context.user_data.clear()
-        return ConversationHandler.END
+
+    data: AlertData | None = context.chat_data.get(PENDING_SEARCHES_KEY, {}).pop(
+        token, None
+    )
+    if data is None:
+        await query.edit_message_text(
+            "Esta búsqueda ya no está activa. Escríbeme un producto para buscar "
+            "de nuevo."
+        )
+        return next_state
+
+    if action != "yes":
+        await query.edit_message_text("De acuerdo, no crearé ninguna alerta. 👍")
+        return next_state
 
     chat_id = update.effective_chat.id
-    name: str = context.user_data["name"]
-    max_price: float = context.user_data["max_price"]
+    name, max_price = data.name, data.max_price
     job_name = alert_job_name(chat_id, name, max_price)
     existing = _alert_jobs(context, chat_id)
 
@@ -309,7 +364,7 @@ async def alert_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             first=ALERT_INTERVAL_SECONDS,
             chat_id=chat_id,
             name=job_name,
-            data=AlertData(name, max_price, context.user_data.get("snapshot", {})),
+            data=data,
         )
         text = (
             f"🔔 Alerta creada para <b>{escape(name)}</b> ≤ {max_price:.2f}€. "
@@ -318,8 +373,7 @@ async def alert_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         )
 
     await query.edit_message_text(text, parse_mode=ParseMode.HTML)
-    context.user_data.clear()
-    return ConversationHandler.END
+    return next_state
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -337,13 +391,6 @@ async def _end(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) ->
     context.user_data.clear()
     await update.effective_message.reply_text(text)
     return ConversationHandler.END
-
-
-async def expired_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Botón de una búsqueda anterior que ya no está en curso."""
-    query = update.callback_query
-    await query.answer("Esta búsqueda ya no está activa.")
-    await query.edit_message_reply_markup(reply_markup=None)
 
 
 # --- Alertas ------------------------------------------------------------------
@@ -494,7 +541,8 @@ def build_application(
     application.add_handler(_conversation(chats))
     application.add_handler(CommandHandler("alertas", list_alerts, filters=chats))
     application.add_handler(CommandHandler("parar", stop_alerts, filters=chats))
-    application.add_handler(CallbackQueryHandler(expired_button, pattern=r"^alert:"))
+    # Botones pulsados fuera de la conversación (búsquedas anteriores).
+    application.add_handler(CallbackQueryHandler(alert_choice, pattern=r"^alert:"))
     application.add_error_handler(on_error)
     return application
 
@@ -536,7 +584,8 @@ def _conversation(chats: filters.BaseFilter) -> ConversationHandler:
                 ],
             },
             fallbacks=[CommandHandler("cancel", cancel, filters=chats), restart],
-            conversation_timeout=CONVERSATION_TIMEOUT_SECONDS,
+            # Sin conversation_timeout: tras los resultados se espera, sin
+            # límite, a que el usuario pulse "Crear Alerta" o "Cancelar".
         )
 
 

@@ -65,6 +65,7 @@ class FakeJobQueue:
 def make_context(user_data: dict[str, Any] | None = None) -> Any:
     return SimpleNamespace(
         user_data={} if user_data is None else user_data,
+        chat_data={},
         job_queue=FakeJobQueue(),
         bot=SimpleNamespace(send_message=AsyncMock()),
         job=None,
@@ -152,13 +153,17 @@ def test_receive_price_searches_and_lists_price_and_stock(
     assert results.index("RTX &lt;C&gt;") < results.index("RTX B")
     keyboard = update.effective_message.reply_text.call_args.kwargs["reply_markup"]
     assert isinstance(keyboard, InlineKeyboardMarkup)
+    token = context.user_data["token"]
     buttons = [(b.text, b.callback_data) for b in keyboard.inline_keyboard[0]]
     assert buttons == [
-        ("🔔 Crear Alerta", bot.CALLBACK_ALERT_YES),
-        ("❌ Cancelar", bot.CALLBACK_ALERT_NO),
+        ("🔔 Crear Alerta", f"{bot.CALLBACK_ALERT_YES}:{token}"),
+        ("❌ Cancelar", f"{bot.CALLBACK_ALERT_NO}:{token}"),
     ]
+    assert all(len(data.encode()) <= 64 for _, data in buttons)  # límite Telegram
     assert "30 minutos" in question
-    assert set(context.user_data["snapshot"]) == {A_OK.url, B_OUT.url, C_OK.url}
+    pending = context.chat_data[bot.PENDING_SEARCHES_KEY][token]
+    assert (pending.name, pending.max_price) == ("rtx", 600.0)
+    assert set(pending.snapshot) == {A_OK.url, B_OUT.url, C_OK.url}
 
 
 def test_receive_price_without_stock_still_offers_alert(
@@ -204,14 +209,26 @@ def test_receive_price_ends_on_network_error(monkeypatch: pytest.MonkeyPatch) ->
     assert context.user_data == {}
 
 
-def _choose(data: str, context: Any) -> tuple[int, Any]:
-    update = make_update(callback_data=data)
+def _choose(action: str, context: Any, token: str = "t1") -> tuple[int, Any]:
+    update = make_update(callback_data=f"{action}:{token}")
     return run(bot.alert_choice(update, context)), update
 
 
-def _alert_context() -> Any:
+def _pending(
+    context: Any, name: str, max_price: float, token: str, current: bool = True
+) -> None:
+    """Simula una búsqueda mostrada con sus botones (como hace receive_price)."""
     snapshot = bot.take_snapshot([A_OK])
-    return make_context({"name": "rtx", "max_price": 600.0, "snapshot": snapshot})
+    pending = context.chat_data.setdefault(bot.PENDING_SEARCHES_KEY, {})
+    pending[token] = bot.AlertData(name, max_price, snapshot)
+    if current:
+        context.user_data.update(name=name, max_price=max_price, token=token)
+
+
+def _alert_context() -> Any:
+    context = make_context()
+    _pending(context, "rtx", 600.0, "t1")
+    return context
 
 
 def test_alert_yes_schedules_repeating_job() -> None:
@@ -231,27 +248,28 @@ def test_alert_yes_schedules_repeating_job() -> None:
     text = update.callback_query.edit_message_text.call_args.args[0]
     assert "Alerta creada" in text
     assert context.user_data == {}
+    assert context.chat_data[bot.PENDING_SEARCHES_KEY] == {}  # botón ya usado
 
 
 def test_alert_yes_does_not_duplicate_same_alert() -> None:
     context = _alert_context()
     _choose(bot.CALLBACK_ALERT_YES, context)
-    context.user_data.update(name="RTX", max_price=600.0)
+    _pending(context, "RTX", 600.0, "t2")
 
-    _, update = _choose(bot.CALLBACK_ALERT_YES, context)
+    _, update = _choose(bot.CALLBACK_ALERT_YES, context, "t2")
 
     assert len(context.job_queue.jobs()) == 1
     assert "Ya tenías" in update.callback_query.edit_message_text.call_args.args[0]
 
 
 def test_alert_yes_respects_limit_per_chat() -> None:
-    context = _alert_context()
+    context = make_context()
     for i in range(bot.MAX_ALERTS_PER_CHAT):
-        context.user_data.update(name=f"p{i}", max_price=10.0)
-        _choose(bot.CALLBACK_ALERT_YES, context)
-    context.user_data.update(name="otra", max_price=10.0)
+        _pending(context, f"p{i}", 10.0, f"t{i}")
+        _choose(bot.CALLBACK_ALERT_YES, context, f"t{i}")
+    _pending(context, "otra", 10.0, "tx")
 
-    _, update = _choose(bot.CALLBACK_ALERT_YES, context)
+    _, update = _choose(bot.CALLBACK_ALERT_YES, context, "tx")
 
     assert len(context.job_queue.jobs()) == bot.MAX_ALERTS_PER_CHAT
     assert "máximo" in update.callback_query.edit_message_text.call_args.args[0]
@@ -491,16 +509,127 @@ def test_direct_search_flow_asks_only_for_price(
     assert search == [("RTX 4070", 600.0)]
 
 
-def test_expired_button_is_answered() -> None:
-    update = make_update(callback_data=bot.CALLBACK_ALERT_YES)
-    update.callback_query.edit_message_reply_markup = AsyncMock()
+# --- Botones: la conversación espera a que se pulsen ------------------------------
 
-    run(bot.expired_button(update, make_context()))
+
+def test_conversation_has_no_timeout() -> None:
+    """Tras los resultados no se vuelve solo al estado inicial."""
+    conversation = bot._conversation(filters.ALL)
+
+    assert conversation.conversation_timeout is None
+
+
+def test_buttons_keep_the_conversation_waiting_in_ask_alert(
+    search: list[tuple[str, float]],
+) -> None:
+    update, context = make_update("600"), make_context({"name": "rtx"})
+
+    assert run(bot.receive_price(update, context)) == bot.ASK_ALERT
+    # Estado ASK_ALERT: sigue aceptando el botón de esa búsqueda.
+    conversation = bot._conversation(filters.ALL)
+    (button,) = (
+        h
+        for h in conversation.states[bot.ASK_ALERT]
+        if isinstance(h, CallbackQueryHandler)
+    )
+    assert button.callback is bot.alert_choice
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        f"{bot.CALLBACK_ALERT_YES}:t1",
+        f"{bot.CALLBACK_ALERT_NO}:t1",
+        f"{bot.CALLBACK_ALERT_YES}:desconocido",
+        bot.CALLBACK_ALERT_YES,  # formato antiguo, sin token
+        "alert:",
+    ],
+)
+def test_every_button_press_is_answered_first(data: str) -> None:
+    context = _alert_context()
+    update = make_update(callback_data=data)
+    calls: list[str] = []
+    update.callback_query.answer.side_effect = lambda *a, **k: calls.append("answer")
+    update.callback_query.edit_message_text.side_effect = lambda *a, **k: calls.append(
+        "edit"
+    )
+
+    run(bot.alert_choice(update, context))
 
     update.callback_query.answer.assert_awaited_once()
-    update.callback_query.edit_message_reply_markup.assert_awaited_once_with(
-        reply_markup=None
-    )
+    assert calls[0] == "answer"
+
+
+def test_unknown_button_explains_search_is_no_longer_active() -> None:
+    context = make_context()
+
+    state, update = _choose(bot.CALLBACK_ALERT_YES, context, "viejo")
+
+    assert state == ConversationHandler.END
+    assert context.job_queue.jobs() == []
+    text = update.callback_query.edit_message_text.call_args.args[0]
+    assert "ya no está activa" in text
+
+
+def test_button_of_a_previous_search_still_works(
+    search: list[tuple[str, float]],
+) -> None:
+    """Empezar otra búsqueda no invalida los botones de la anterior."""
+    context = make_context({"name": "rtx"})
+    run(bot.receive_price(make_update("600"), context))
+    old_token = context.user_data["token"]
+
+    # El usuario escribe otro producto y luego pulsa el botón antiguo.
+    run(bot.receive_name(make_update("ps5"), context))
+    run(bot.receive_price(make_update("500"), context))
+    new_token = context.user_data["token"]
+    state, update = _choose(bot.CALLBACK_ALERT_YES, context, old_token)
+
+    (job,) = context.job_queue.jobs()
+    assert (job.data.name, job.data.max_price) == ("rtx", 600.0)
+    assert "Alerta creada" in update.callback_query.edit_message_text.call_args.args[0]
+    # La búsqueda en curso sigue esperando sus propios botones.
+    assert state == bot.ASK_ALERT
+    assert context.user_data["token"] == new_token
+    assert new_token in context.chat_data[bot.PENDING_SEARCHES_KEY]
+
+
+def test_cancel_button_ends_only_after_explicit_press(
+    search: list[tuple[str, float]],
+) -> None:
+    context = make_context({"name": "rtx"})
+    assert run(bot.receive_price(make_update("600"), context)) == bot.ASK_ALERT
+    token = context.user_data["token"]
+
+    state, update = _choose(bot.CALLBACK_ALERT_NO, context, token)
+
+    assert state == ConversationHandler.END
+    assert context.job_queue.jobs() == []
+    assert "no crearé" in update.callback_query.edit_message_text.call_args.args[0]
+    assert token not in context.chat_data[bot.PENDING_SEARCHES_KEY]
+
+
+def test_pending_searches_are_capped() -> None:
+    context = make_context()
+
+    tokens = [
+        bot._remember_search(context, bot.AlertData(f"p{i}", 10.0))
+        for i in range(bot.MAX_PENDING_SEARCHES + 3)
+    ]
+
+    pending = context.chat_data[bot.PENDING_SEARCHES_KEY]
+    assert list(pending) == tokens[-bot.MAX_PENDING_SEARCHES :]
+
+
+def test_buttons_outside_conversation_are_handled_by_alert_choice() -> None:
+    app = bot.build_application("123456:TEST-token")
+
+    outside = [
+        h
+        for h in app.handlers[0]
+        if isinstance(h, CallbackQueryHandler) and h.callback is bot.alert_choice
+    ]
+    assert len(outside) == 1
 
 
 def test_parse_allowed_chats() -> None:

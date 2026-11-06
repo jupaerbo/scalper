@@ -9,6 +9,7 @@ import functools
 import html as html_lib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -744,7 +745,9 @@ async def search_products(
             offers[product.url] = product
         return True
 
-    def ingest(results: list[dict]) -> None:
+    def ingest(results: list[dict], *, recheck: bool = True) -> None:
+        """Clasifica resultados; con ``recheck=False`` los que superan
+        ``max_price`` se descartan sin revisar su página."""
         for result in results:
             product = parse_web_result(result)
             if product is None:
@@ -752,6 +755,7 @@ async def search_products(
                     priceless.setdefault(url, result)
             elif (
                 not accept(product)
+                and recheck
                 and product.price <= max_price * RECHECK_PRICE_MARGIN
             ):
                 over_budget.setdefault(product.url, result)
@@ -784,7 +788,9 @@ async def search_products(
     #    llamada por búsqueda para no gastar cuota.
     if (api := search_api_config()) is not None:
         try:
-            ingest(await api_search(queries[0], api, client=api_client))
+            results = await api_search(
+                build_api_query(name, max_price), api, client=api_client
+            )
         except Exception as exc:
             logger.warning(
                 "La API de búsqueda (%s) falló: %s; usando ddgs",
@@ -792,6 +798,9 @@ async def search_products(
                 describe_api_error(exc),
             )
         else:
+            # Filtro estricto: lo que ya supera el límite en el snippet de la
+            # API se descarta antes de inspeccionar ninguna página.
+            ingest(filter_by_max_price(results, max_price), recheck=False)
             if found_nothing():
                 logger.info("La API (%s) no dio resultados; usando ddgs", api.provider)
 
@@ -1230,6 +1239,47 @@ async def enrich_with_page_prices(
         for (result, url), page in zip(targets, found, strict=True)
         if page is not None
     ]
+
+
+def build_api_query(name: str, max_price: float) -> str:
+    """Consulta avanzada de Google para la API de búsqueda.
+
+    Producto entre comillas (coincidencia exacta), rango de precio con el
+    operador numérico ``..`` y términos de compra:
+    ``rtx 4070``, 700 → ``"rtx 4070" 1€..700€ comprar OR tienda``.
+
+    Se quitan del nombre las comillas y los términos de compra que ya llevara
+    (``PURCHASE_TERMS``), para no duplicarlos ni romper la frase exacta.
+    """
+    words = [
+        w
+        for w in name.replace('"', " ").replace("'", " ").split()
+        if w.casefold() not in PURCHASE_TERMS
+    ]
+    product = " ".join(words) or name.strip().replace('"', "")
+    top = max(1, math.ceil(max_price))
+    return f'"{product}" 1€..{top}€ comprar OR tienda'
+
+
+def filter_by_max_price(
+    results: list[dict[str, str]], max_price: float
+) -> list[dict[str, str]]:
+    """Quita los resultados cuyo precio (título o snippet) supera ``max_price``.
+
+    Los resultados sin precio reconocible se conservan: su precio se buscará
+    después en la página.
+    """
+    kept = []
+    for result in results:
+        product = parse_web_result(result)
+        if product is not None and product.price > max_price:
+            continue
+        kept.append(result)
+    if dropped := len(results) - len(kept):
+        logger.info(
+            "Descartados %d resultado(s) de la API por precio > %s", dropped, max_price
+        )
+    return kept
 
 
 def build_queries(name: str) -> list[str]:

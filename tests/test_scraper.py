@@ -1727,7 +1727,7 @@ def test_api_is_the_primary_engine_when_key_is_set(
     # 649 € va primero por estar "En stock"; 599,90 € tiene stock sin confirmar.
     assert [p.price for p in products] == [649.0, 599.9]
     assert len(requests) == 1  # una sola llamada: no gasta cuota de más
-    assert json_query(requests[0]) == build_queries("rtx 4070")[0]
+    assert json_query(requests[0]) == '"rtx 4070" 1€..1000€ comprar OR tienda'
     assert fn.queries == []
 
 
@@ -1889,3 +1889,104 @@ def test_api_price_respects_max_price(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
     assert [p.price for p in products] == [599.9]
+
+
+# --- API: consulta avanzada con rango de precio y filtro estricto ---------------
+
+from scraper import build_api_query, filter_by_max_price  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    ("name", "max_price", "expected"),
+    [
+        ("rtx 4070", 700.0, '"rtx 4070" 1€..700€ comprar OR tienda'),
+        ("RTX 4070", 649.99, '"RTX 4070" 1€..650€ comprar OR tienda'),
+        (
+            'comprar "iPhone 15" precio €',
+            900.0,
+            '"iPhone 15" 1€..900€ comprar OR tienda',
+        ),
+        ("cable", 0.5, '"cable" 1€..1€ comprar OR tienda'),
+    ],
+)
+def test_build_api_query_uses_google_price_range(
+    name: str, max_price: float, expected: str
+) -> None:
+    assert build_api_query(name, max_price) == expected
+
+
+def test_serper_payload_targets_spain_with_price_range_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_api(monkeypatch)
+    requests: list[httpx.Request] = []
+
+    _search_with_api(
+        _Scripted(),
+        httpx.Response(200, json=SERPER_RESPONSE),
+        requests,
+        max_price=700.0,
+    )
+
+    import json
+
+    payload = json.loads(requests[0].content)
+    assert payload["gl"] == "es"
+    assert payload["hl"] == "es"
+    assert payload["q"] == '"rtx 4070" 1€..700€ comprar OR tienda'
+    assert requests[0].method == "POST"
+
+
+def test_filter_by_max_price_drops_only_priced_results_over_limit() -> None:
+    results = [
+        {"title": "A 500 €", "href": "https://a.es/p", "body": ""},
+        {"title": "B", "href": "https://b.es/p", "body": "Ahora 750 €"},
+        {"title": "C sin precio", "href": "https://c.es/p", "body": "Ficha técnica"},
+        {"title": "D 700 €", "href": "https://d.es/p", "body": ""},
+    ]
+
+    kept = filter_by_max_price(results, 700.0)
+
+    assert [r["href"] for r in kept] == [
+        "https://a.es/p",
+        "https://c.es/p",  # sin precio: se inspeccionará su página
+        "https://d.es/p",  # el límite es inclusivo
+    ]
+
+
+def test_api_results_over_max_price_are_never_inspected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Con la API, lo que supera el límite se descarta sin descargar su página
+    (a diferencia de ddgs, donde se revisa por si hay rebaja)."""
+    _enable_api(monkeypatch)
+    response = {
+        "organic": [
+            {"title": "RTX 4070 - 720 €", "link": "https://caro.es/p", "snippet": ""},
+            {"title": "RTX 4070 barata", "link": "https://t1.es/p", "snippet": ""},
+        ]
+    }
+    fetched: list[str] = []
+
+    def pages(request: httpx.Request) -> httpx.Response:
+        fetched.append(str(request.url))
+        return _html(HTML_OG)  # 589,90 €
+
+    async def run() -> list[Product]:
+        transport = httpx.MockTransport(pages)
+        async with (
+            _api_client(httpx.Response(200, json=response)) as api,
+            httpx.AsyncClient(transport=transport) as page_client,
+        ):
+            return await search_products(
+                "rtx 4070",
+                700.0,
+                search_fn=_Scripted(),
+                api_client=api,
+                page_client=page_client,
+            )
+
+    products = asyncio.run(run())
+
+    assert [(p.url, p.price) for p in products] == [("https://t1.es/p", 589.9)]
+    assert fetched == ["https://t1.es/p"]
