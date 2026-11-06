@@ -1,4 +1,5 @@
 import asyncio
+import re
 from collections.abc import Iterator
 
 import httpx
@@ -1727,7 +1728,7 @@ def test_api_is_the_primary_engine_when_key_is_set(
     # 649 € va primero por estar "En stock"; 599,90 € tiene stock sin confirmar.
     assert [p.price for p in products] == [649.0, 599.9]
     assert len(requests) == 1  # una sola llamada: no gasta cuota de más
-    assert json_query(requests[0]) == '"rtx 4070" 1€..1000€ comprar OR tienda'
+    assert json_query(requests[0]) == "rtx 4070 1..1000 €"
     assert fn.queries == []
 
 
@@ -1899,20 +1900,50 @@ from scraper import build_api_query, filter_by_max_price  # noqa: E402
 @pytest.mark.parametrize(
     ("name", "max_price", "expected"),
     [
-        ("rtx 4070", 700.0, '"rtx 4070" 1€..700€ comprar OR tienda'),
-        ("RTX 4070", 649.99, '"RTX 4070" 1€..650€ comprar OR tienda'),
+        ("rtx 4070", 700.0, "rtx 4070 1..700 €"),
+        ("RTX 4070", 649.99, "RTX 4070 1..650 €"),
+        ('comprar "iPhone 15" precio €', 900.0, "iPhone 15 1..900 €"),
+        ("cable", 0.5, "cable 1..1 €"),
+        # Comillas tipográficas, paréntesis, operadores y símbolos fuera.
         (
-            'comprar "iPhone 15" precio €',
-            900.0,
-            '"iPhone 15" 1€..900€ comprar OR tienda',
+            "“MSI” RTX-4070 (Ventus 2X) -funda *oferta* 12GB!",
+            700.0,
+            "MSI RTX-4070 Ventus 2X funda 12GB 1..700 €",
         ),
-        ("cable", 0.5, '"cable" 1€..1€ comprar OR tienda'),
+        (
+            'SSD 2.5" 1TB <Samsung> & más',
+            90.0,
+            "SSD 2.5 1TB Samsung más 1..90 €",
+        ),
+        (
+            "usb-c 3.1 cable: 2m; ¿barato?",
+            15.0,
+            "usb-c 3.1 cable 2m 1..15 €",
+        ),
+        ("Core i7+ 13700K", 400.0, "Core i7+ 13700K 1..400 €"),
+        ("comprar precio €", 100.0, "comprar precio 1..100 €"),
     ],
 )
-def test_build_api_query_uses_google_price_range(
+def test_build_api_query_uses_clean_price_range(
     name: str, max_price: float, expected: str
 ) -> None:
     assert build_api_query(name, max_price) == expected
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        'rtx "4070"',
+        "“MSI” RTX-4070 (Ventus) -funda *oferta*",
+        'SSD <1TB> & {más} [nuevo] | 2.5" ~ ^ = % $ # @ \\ `',
+    ],
+)
+def test_build_api_query_has_no_quotes_or_special_characters(name: str) -> None:
+    query = build_api_query(name, 700.0)
+
+    assert re.fullmatch(r"[\w .,+\-/€]+", query), query
+    assert "€.." not in query and "..€" not in query  # rango sin moneda dentro
+    assert query.endswith(" 1..700 €")
 
 
 def test_serper_payload_targets_spain_with_price_range_query(
@@ -1933,7 +1964,7 @@ def test_serper_payload_targets_spain_with_price_range_query(
     payload = json.loads(requests[0].content)
     assert payload["gl"] == "es"
     assert payload["hl"] == "es"
-    assert payload["q"] == '"rtx 4070" 1€..700€ comprar OR tienda'
+    assert payload["q"] == "rtx 4070 1..700 €"
     assert requests[0].method == "POST"
 
 
@@ -1990,3 +2021,176 @@ def test_api_results_over_max_price_are_never_inspected(
 
     assert [(p.url, p.price) for p in products] == [("https://t1.es/p", 589.9)]
     assert fetched == ["https://t1.es/p"]
+
+
+# --- API: consulta ultra-limpia y reintento sin rango ---------------------------
+
+from scraper import clean_api_product, search_api_with_fallback  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("rtx-4070 super", "rtx-4070 super"),
+        ("“MSI” RTX-4070 [Ventus] *oferta* comprar", "MSI RTX-4070 Ventus"),
+        ('"iPhone 15 Pro" 256GB precio €', "iPhone 15 Pro 256GB"),
+    ],
+)
+def test_clean_api_product(name: str, expected: str) -> None:
+    assert clean_api_product(name) == expected
+
+
+def test_api_query_has_no_purchase_terms() -> None:
+    assert build_api_query("comprar rtx 4070 oferta tienda barato", 700.0) == (
+        "rtx 4070 1..700 €"
+    )
+
+
+def _scripted_api(*responses: httpx.Response) -> tuple[httpx.AsyncClient, list[str]]:
+    """Cliente cuya respuesta n-ésima es ``responses[n]``; anota cada ``q``."""
+    queue = list(responses)
+    queries: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        queries.append(json_query(request))
+        return queue.pop(0)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler)), queries
+
+
+def _run_fallback(*responses: httpx.Response, max_price: float = 700.0) -> tuple:
+    client, queries = _scripted_api(*responses)
+
+    async def run() -> list[dict[str, str]]:
+        async with client:
+            return await search_api_with_fallback(
+                "Comprar “RTX-4070” super",
+                max_price,
+                SearchApiConfig("serper", API_KEY),
+                client=client,
+            )
+
+    return asyncio.run(run()), queries
+
+
+def test_range_query_with_results_needs_a_single_call() -> None:
+    results, queries = _run_fallback(httpx.Response(200, json=SERPER_RESPONSE))
+
+    assert queries == ["RTX-4070 super 1..700 €"]
+    assert [r["href"] for r in results] == [
+        "https://pctienda.es/msi-rtx-4070",
+        "https://otra.es/eagle",
+    ]
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        httpx.Response(400, json={"message": "Query not allowed"}),
+        httpx.Response(200, json={"organic": []}),
+        httpx.Response(200, json={}),
+    ],
+)
+def test_400_or_zero_results_retries_with_product_only(first: httpx.Response) -> None:
+    results, queries = _run_fallback(first, httpx.Response(200, json=SERPER_RESPONSE))
+
+    assert queries == ["RTX-4070 super 1..700 €", "RTX-4070 super"]
+    assert len(results) == 2
+
+
+@pytest.mark.parametrize("status", [401, 403, 429, 500])
+def test_other_api_errors_do_not_retry_without_range(status: int) -> None:
+    client, queries = _scripted_api(httpx.Response(status))
+
+    async def run() -> None:
+        async with client:
+            await search_api_with_fallback(
+                "rtx 4070", 700.0, SearchApiConfig("serper", API_KEY), client=client
+            )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(run())
+    assert queries == ["rtx 4070 1..700 €"]
+
+
+def test_retry_failure_propagates_and_search_falls_back_to_ddgs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_api(monkeypatch)
+    client, queries = _scripted_api(httpx.Response(400), httpx.Response(400))
+
+    async def run() -> list[Product]:
+        async with client:
+            return await search_products(
+                "rtx 4070", 1000.0, search_fn=_Scripted([_offer(1)]), api_client=client
+            )
+
+    products = asyncio.run(run())
+
+    assert queries == ["rtx 4070 1..1000 €", "rtx 4070"]
+    assert [p.store_name for p in products] == ["tienda1.es"]
+
+
+def test_retry_without_range_is_still_filtered_by_max_price() -> None:
+    """Sin el operador de rango Google devuelve de todo: el filtro lo recorta."""
+    unfiltered = {
+        "organic": [
+            {"title": "RTX 4070 - 549 €", "link": "https://a.es/p", "snippet": ""},
+            {"title": "RTX 4070 Ti - 899 €", "link": "https://b.es/p", "snippet": ""},
+            {"title": "RTX 4070 ficha", "link": "https://c.es/p", "snippet": ""},
+        ]
+    }
+
+    results, _ = _run_fallback(
+        httpx.Response(200, json={"organic": []}),
+        httpx.Response(200, json=unfiltered),
+        max_price=600.0,
+    )
+
+    assert [r["href"] for r in results] == ["https://a.es/p", "https://c.es/p"]
+
+
+def test_zero_results_in_both_calls_falls_back_to_ddgs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_api(monkeypatch)
+    empty = {"organic": []}
+    client, queries = _scripted_api(
+        httpx.Response(200, json=empty), httpx.Response(200, json=empty)
+    )
+
+    async def run() -> list[Product]:
+        async with client:
+            return await search_products(
+                "rtx 4070", 1000.0, search_fn=_Scripted([_offer(1)]), api_client=client
+            )
+
+    products = asyncio.run(run())
+
+    assert len(queries) == 2
+    assert [p.store_name for p in products] == ["tienda1.es"]
+
+
+def test_retry_payload_keeps_spanish_localisation() -> None:
+    sent: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        if len(sent) == 1:
+            return httpx.Response(400)
+        return httpx.Response(200, json=SERPER_RESPONSE)
+
+    async def run() -> None:
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            await search_api_with_fallback(
+                "rtx 4070", 700.0, SearchApiConfig("serper", API_KEY), client=client
+            )
+
+    asyncio.run(run())
+
+    import json
+
+    payloads = [json.loads(r.content) for r in sent]
+    assert [p["q"] for p in payloads] == ["rtx 4070 1..700 €", "rtx 4070"]
+    assert all(p["gl"] == "es" and p["hl"] == "es" for p in payloads)

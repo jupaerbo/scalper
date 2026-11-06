@@ -784,12 +784,12 @@ async def search_products(
     queries = build_queries(name)
     failure: tuple[Exception, int] | None = None
 
-    # 1) Motor principal: la API de búsqueda, si hay SEARCH_API_KEY. Una sola
-    #    llamada por búsqueda para no gastar cuota.
+    # 1) Motor principal: la API de búsqueda, si hay SEARCH_API_KEY. Una
+    #    llamada con rango de precio (dos si hay que repetirla sin rango).
     if (api := search_api_config()) is not None:
         try:
-            results = await api_search(
-                build_api_query(name, max_price), api, client=api_client
+            results = await search_api_with_fallback(
+                name, max_price, api, client=api_client
             )
         except Exception as exc:
             logger.warning(
@@ -798,9 +798,9 @@ async def search_products(
                 describe_api_error(exc),
             )
         else:
-            # Filtro estricto: lo que ya supera el límite en el snippet de la
-            # API se descarta antes de inspeccionar ninguna página.
-            ingest(filter_by_max_price(results, max_price), recheck=False)
+            # Ya filtrados por precio: lo que supera el límite en el snippet
+            # se descarta sin inspeccionar su página.
+            ingest(results, recheck=False)
             if found_nothing():
                 logger.info("La API (%s) no dio resultados; usando ddgs", api.provider)
 
@@ -1241,24 +1241,76 @@ async def enrich_with_page_prices(
     ]
 
 
-def build_api_query(name: str, max_price: float) -> str:
-    """Consulta avanzada de Google para la API de búsqueda.
+# Palabras del nombre: letras/cifras unidas por . , + - / ("rtx-4070", "2.5",
+# "usb-c", "i7+"); cualquier otro carácter (comillas, paréntesis, €, *, :…)
+# actúa de separador y se descarta.
+_API_WORD = re.compile(r"[^\W_]+(?:[.,+\-/][^\W_]+)*\+?")
 
-    Producto entre comillas (coincidencia exacta), rango de precio con el
-    operador numérico ``..`` y términos de compra:
-    ``rtx 4070``, 700 → ``"rtx 4070" 1€..700€ comprar OR tienda``.
 
-    Se quitan del nombre las comillas y los términos de compra que ya llevara
-    (``PURCHASE_TERMS``), para no duplicarlos ni romper la frase exacta.
+def clean_api_product(name: str) -> str:
+    """Nombre del producto apto para la API: ``“MSI” RTX-4070 (Ventus) *oferta*``
+    → ``MSI RTX-4070 Ventus``.
+
+    Quita comillas, corchetes, operadores (``-palabra``), ``*`` y demás
+    caracteres que pueden provocar un HTTP 400 en Serper, y los términos de
+    compra (``PURCHASE_TERMS``). Conserva guiones, puntos y ``+`` internos de
+    modelos (``rtx-4070``, ``usb-c``, ``2.5``, ``i7+``).
     """
-    words = [
-        w
-        for w in name.replace('"', " ").replace("'", " ").split()
-        if w.casefold() not in PURCHASE_TERMS
-    ]
-    product = " ".join(words) or name.strip().replace('"', "")
+    words = _API_WORD.findall(name)
+    product = [w for w in words if w.casefold() not in PURCHASE_TERMS]
+    return " ".join(product or words)
+
+
+def build_api_query(name: str, max_price: float) -> str:
+    """Consulta con rango de precio: estrictamente ``{producto} 1..{max} €``.
+
+    ``rtx 4070``, 649,99 → ``rtx 4070 1..650 €`` (el máximo se redondea hacia
+    arriba y el operador ``..`` va sin símbolos de moneda dentro).
+    """
     top = max(1, math.ceil(max_price))
-    return f'"{product}" 1€..{top}€ comprar OR tienda'
+    return f"{clean_api_product(name)} 1..{top} €"
+
+
+async def search_api_with_fallback(
+    name: str,
+    max_price: float,
+    config: SearchApiConfig,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> list[dict[str, str]]:
+    """Busca en la API con rango de precio y, si hace falta, sin él.
+
+    1. ``build_api_query`` (``{producto} 1..{max} €``).
+    2. Si responde HTTP 400 o 0 resultados, reintenta con solo
+       ``clean_api_product`` (el operador de rango no siempre se admite).
+
+    A cada respuesta se le aplica ``filter_by_max_price``.
+
+    Returns:
+        Resultados que no superan ``max_price`` (los sin precio se conservan).
+
+    Raises:
+        httpx.HTTPError, ValueError: Si la API falla (401, 429, red…), o si el
+            reintento sin rango también falla.
+    """
+    queries = (build_api_query(name, max_price), clean_api_product(name))
+    for attempt, query in enumerate(queries):
+        last = attempt == len(queries) - 1
+        try:
+            results = await api_search(query, config, client=client)
+        except httpx.HTTPStatusError as exc:
+            if last or exc.response.status_code != 400:
+                raise
+            logger.info(
+                "API (%s): HTTP 400 con rango; reintento sin rango", config.provider
+            )
+            continue
+        if results or last:
+            return filter_by_max_price(results, max_price)
+        logger.info(
+            "API (%s): 0 resultados con rango; reintento sin rango", config.provider
+        )
+    return []  # pragma: no cover - el bucle siempre retorna o lanza
 
 
 def filter_by_max_price(
